@@ -84,23 +84,19 @@ MUSIC_FOOTER = "⬡ VAULTBOT AUDIO  //  LIVE PLAYER"
 # Music settings.
 DEFAULT_VOLUME = 0.5
 MAX_VOLUME_PERCENT = 200  # 100 = original loudness; above that the audio is amplified
-# MP3 bitrate requested from the Juice WRLD API for playback/radio. The API answered "406 Not Acceptable"
-# to 320k for every track, so keep this at 160k (the value that worked). If you try another value, watch the
-# console: repeated "406" lines mean the API rejects it and every song falls back to the slower original file.
-JW_PLAYBACK_BITRATE = "160k"
-# --- Traffic savers (hosting plans meter inbound + outbound data together) ---------------------------
-# Use a lower 64 kbps encoder target by default to reduce Discord voice egress.
-# Owners can set VAULTBOT_MUSIC_MAX_KBPS=96 if they prefer higher quality over more play time.
+# Prefer the compressed Juice WRLD endpoint; if 64k is unsupported, the downloader
+# falls back to the original but the strict per-track cap prevents large transfers.
+JW_PLAYBACK_BITRATE = os.getenv("VAULTBOT_JW_PLAYBACK_BITRATE", "64k").strip() or "64k"
+# Low-traffic mode: 32 kbps outgoing voice target (lower fidelity, less bandwidth).
+# Owners may set VAULTBOT_MUSIC_MAX_KBPS, but the safety cap stays at 48 kbps.
 try:
-    MUSIC_MAX_KBPS = min(96, max(64, int(os.getenv("VAULTBOT_MUSIC_MAX_KBPS", "64"))))
+    MUSIC_MAX_KBPS = min(48, max(24, int(os.getenv("VAULTBOT_MUSIC_MAX_KBPS", "32"))))
 except (TypeError, ValueError):
-    MUSIC_MAX_KBPS = 64
-# Radio skips audio files bigger than this (big WAVs waste data and usually time out anyway).
-JW_RADIO_MAX_MB = 15
-# Leave the voice channel after this many seconds with no humans in it (0 = never leave).
-VOICE_IDLE_LEAVE_SECONDS = 120
+    MUSIC_MAX_KBPS = 32
+JW_RADIO_MAX_MB = 5
+VOICE_IDLE_LEAVE_SECONDS = 60
 ALLOWED_UPLOAD_SUFFIXES = {".mp3", ".wav", ".opus", ".ogg", ".m4a", ".flac"}
-MAX_UPLOAD_MB = 20
+MAX_UPLOAD_MB = 5
 
 # Juice WRLD API settings.
 # Public read endpoints are used by default; no API key is required for them.
@@ -121,7 +117,8 @@ def _positive_int_env(name: str, default: int) -> int:
         return default
 
 
-JUICEWRLD_POLL_MINUTES = max(10, _positive_int_env("JUICEWRLD_POLL_MINUTES", 15))
+# Tracker alerts trade freshness for substantially fewer repeated API requests.
+JUICEWRLD_POLL_MINUTES = max(60, _positive_int_env("JUICEWRLD_POLL_MINUTES", 60))
 JUICEWRLD_STATE_FILE = Path(os.getenv(
     "JUICEWRLD_STATE_FILE",
     str(Path(tempfile.gettempdir()) / "juicewrld_seen.json")
@@ -143,22 +140,23 @@ JUICEWRLD_CATALOG_CACHE_FILE = Path(os.getenv(
 # allowance should be approached. It is deliberately not presented as an exact
 # replacement for the host's traffic meter.
 _TRAFFIC_MIB = 1024 * 1024
-# Default hard stop at 500 MiB (about 524 MB decimal), leaving roughly 476 MB
-# of margin beneath a nominal 1 GB provider cap for traffic this process cannot see.
-# The environment override is intentionally capped at 600 MiB for extra safety.
-TRAFFIC_HARD_STOP_MIB = min(600, _positive_int_env("VAULTBOT_TRAFFIC_HARD_STOP_MIB", 500))
+# Strict conservative budget. When Linux exposes /sys/class/net counters, the guard
+# measures total container RX + TX (Discord, music, feeds and API requests together).
+# Stop at 75 MiB by default, leaving a very large reserve beneath FadeHost's 1 GB/day.
+# Keep the configured ceiling conservative even if an older environment value remains set.
+TRAFFIC_HARD_STOP_MIB = min(75, _positive_int_env("VAULTBOT_TRAFFIC_HARD_STOP_MIB", 75))
 TRAFFIC_WARNING_MIB = min(
     max(1, TRAFFIC_HARD_STOP_MIB - 1),
-    _positive_int_env("VAULTBOT_TRAFFIC_WARNING_MIB", 350),
+    _positive_int_env("VAULTBOT_TRAFFIC_WARNING_MIB", 45),
 )
 TRAFFIC_MAX_TRACK_DOWNLOAD_MIB = min(
-    25, _positive_int_env("VAULTBOT_TRAFFIC_MAX_TRACK_DOWNLOAD_MIB", 25)
+    5, _positive_int_env("VAULTBOT_TRAFFIC_MAX_TRACK_DOWNLOAD_MIB", 5)
 )
 TRAFFIC_DOWNLOAD_RESERVE_MIB = min(
-    100, _positive_int_env("VAULTBOT_TRAFFIC_DOWNLOAD_RESERVE_MIB", 30)
+    20, _positive_int_env("VAULTBOT_TRAFFIC_DOWNLOAD_RESERVE_MIB", 15)
 )
 TRAFFIC_VOICE_OVERHEAD_FACTOR = 1.35
-TRAFFIC_CHECK_INTERVAL_SECONDS = 5
+TRAFFIC_CHECK_INTERVAL_SECONDS = 1
 # 5-minute buckets provide a conservative rolling 24-hour window without
 # keeping thousands of per-packet records in memory or on disk.
 _TRAFFIC_BUCKET_SECONDS = 300
@@ -168,6 +166,13 @@ TRAFFIC_STATE_FILE = Path(os.getenv("VAULTBOT_TRAFFIC_STATE_FILE", "/data/vaultb
 _TRAFFIC_FALLBACK_STATE_FILE = Path(tempfile.gettempdir()) / "vaultbot_traffic_state.json"
 _TRAFFIC_STATE_PATH = TRAFFIC_STATE_FILE
 _TRAFFIC_COUNTER_KEYS = (
+    "audio_download_bytes",
+    "attachment_download_bytes",
+    "api_response_bytes",
+    "voice_estimated_bytes",
+    "network_interface_bytes",
+)
+_TRAFFIC_FALLBACK_COUNTER_KEYS = (
     "audio_download_bytes",
     "attachment_download_bytes",
     "api_response_bytes",
@@ -182,6 +187,9 @@ _TRAFFIC_STATE = {
     "attachment_download_bytes": 0,
     "api_response_bytes": 0,
     "voice_estimated_bytes": 0,
+    "network_interface_bytes": 0,
+    "interface_accounting_active": False,
+    "interface_baselines": {},
     "warning_sent": False,
     "hard_stopped": False,
     "hard_stop_notified_guilds": [],
@@ -232,7 +240,11 @@ def _traffic_save_locked(force: bool = False) -> None:
 
 
 def _traffic_refresh_totals_locked() -> int:
-    """Prune old buckets and update aggregate counters for the current rolling window."""
+    """Prune old buckets and total measured RX+TX or fallback estimates.
+
+    When Linux interface counters are available, they are the primary traffic total.
+    Category counters remain diagnostic and are not added on top of network I/O.
+    """
     buckets = _TRAFFIC_STATE.setdefault("buckets", {})
     current_bucket = _traffic_bucket_id()
     oldest_bucket = current_bucket - (_TRAFFIC_BUCKETS_TO_KEEP - 1)
@@ -245,17 +257,106 @@ def _traffic_refresh_totals_locked() -> int:
         if bucket_id < oldest_bucket or not isinstance(buckets.get(key), dict):
             buckets.pop(key, None)
 
-    total = 0
-    for counter in _TRAFFIC_COUNTER_KEYS:
-        value = 0
-        for bucket in buckets.values():
+    totals = {counter: 0 for counter in _TRAFFIC_COUNTER_KEYS}
+    for bucket in buckets.values():
+        if not isinstance(bucket, dict):
+            continue
+        for counter in _TRAFFIC_COUNTER_KEYS:
             try:
-                value += max(0, int(bucket.get(counter, 0) or 0))
+                totals[counter] += max(0, int(bucket.get(counter, 0) or 0))
             except (TypeError, ValueError, AttributeError):
                 continue
+    for counter, value in totals.items():
         _TRAFFIC_STATE[counter] = value
-        total += value
-    return total
+
+    if _TRAFFIC_STATE.get("interface_accounting_active"):
+        return totals["network_interface_bytes"]
+    return sum(totals[key] for key in _TRAFFIC_FALLBACK_COUNTER_KEYS)
+
+
+def _read_network_interface_counters() -> dict:
+    """Read Linux container RX/TX byte counters without requiring another package."""
+    root = Path("/sys/class/net")
+    counters = {}
+    try:
+        interfaces = list(root.iterdir())
+    except OSError:
+        return counters
+    for interface in interfaces:
+        if interface.name == "lo":
+            continue
+        try:
+            rx = int((interface / "statistics" / "rx_bytes").read_text().strip())
+            tx = int((interface / "statistics" / "tx_bytes").read_text().strip())
+            if rx >= 0 and tx >= 0:
+                counters[interface.name] = {"rx": rx, "tx": tx}
+        except (OSError, ValueError):
+            continue
+    return counters
+
+
+def _traffic_sample_network_io() -> bool:
+    """Record container network deltas, including Discord gateway and background traffic."""
+    counters = _read_network_interface_counters()
+    if not counters:
+        return False
+
+    with _TRAFFIC_LOCK:
+        if not _TRAFFIC_STATE.get("interface_accounting_active"):
+            # Do not grant a fresh budget while switching away from legacy estimates.
+            prior_estimate = _traffic_refresh_totals_locked()
+            # Do not seed from the interface's lifetime cumulative counter: the container
+            # may have been alive for days, while the host meter resets daily. Start a new
+            # measured delta baseline now and retain the previous rolling estimate.
+            bucket_key = str(_traffic_bucket_id())
+            bucket = _TRAFFIC_STATE.setdefault("buckets", {}).setdefault(
+                bucket_key, {key: 0 for key in _TRAFFIC_COUNTER_KEYS}
+            )
+            bucket["network_interface_bytes"] = max(
+                int(bucket.get("network_interface_bytes", 0) or 0),
+                prior_estimate,
+            )
+            _TRAFFIC_STATE["interface_accounting_active"] = True
+            _TRAFFIC_STATE["interface_baselines"] = counters
+            used = _traffic_refresh_totals_locked()
+            if used >= TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB:
+                _TRAFFIC_STATE["hard_stopped"] = True
+            _traffic_save_locked(force=True)
+            print(
+                f"[TrafficGuard] Linux network counters enabled; tracking {used / _TRAFFIC_MIB:.1f} MiB RX+TX.",
+                flush=True,
+            )
+            return True
+
+        previous = _TRAFFIC_STATE.get("interface_baselines", {})
+        delta = 0
+        for name, current in counters.items():
+            old = previous.get(name) if isinstance(previous, dict) else None
+            if not isinstance(old, dict):
+                # A newly appeared interface may already have transferred data.
+                delta += current["rx"] + current["tx"]
+                continue
+            for direction in ("rx", "tx"):
+                now_value = current[direction]
+                try:
+                    old_value = int(old.get(direction, 0))
+                except (TypeError, ValueError):
+                    old_value = 0
+                # If a container/interface counter resets, count its new value.
+                delta += (now_value - old_value) if now_value >= old_value else now_value
+
+        if delta > 0:
+            bucket_key = str(_traffic_bucket_id())
+            bucket = _TRAFFIC_STATE.setdefault("buckets", {}).setdefault(
+                bucket_key, {key: 0 for key in _TRAFFIC_COUNTER_KEYS}
+            )
+            bucket["network_interface_bytes"] = max(0, int(bucket.get("network_interface_bytes", 0) or 0)) + delta
+        _TRAFFIC_STATE["interface_baselines"] = counters
+        used = _traffic_refresh_totals_locked()
+        if used >= TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB:
+            _TRAFFIC_STATE["hard_stopped"] = True
+        _traffic_save_locked(force=bool(used >= TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB))
+    return True
 
 
 def _traffic_load_state() -> None:
@@ -284,6 +385,9 @@ def _traffic_load_state() -> None:
             "attachment_download_bytes": 0,
             "api_response_bytes": 0,
             "voice_estimated_bytes": 0,
+            "network_interface_bytes": 0,
+            "interface_accounting_active": False,
+            "interface_baselines": {},
             "warning_sent": False,
             "hard_stopped": False,
             "hard_stop_notified_guilds": [],
@@ -310,6 +414,20 @@ def _traffic_load_state() -> None:
                     _TRAFFIC_STATE["buckets"][str(_traffic_bucket_id())] = legacy_values
             _TRAFFIC_STATE["warning_sent"] = bool(data.get("warning_sent", False))
             _TRAFFIC_STATE["hard_stopped"] = bool(data.get("hard_stopped", False))
+            _TRAFFIC_STATE["interface_accounting_active"] = bool(data.get("interface_accounting_active", False))
+            saved_baselines = data.get("interface_baselines", {})
+            if isinstance(saved_baselines, dict):
+                parsed_baselines = {}
+                for name, value in saved_baselines.items():
+                    if isinstance(value, dict):
+                        try:
+                            parsed_baselines[str(name)] = {
+                                "rx": max(0, int(value.get("rx", 0))),
+                                "tx": max(0, int(value.get("tx", 0))),
+                            }
+                        except (TypeError, ValueError):
+                            continue
+                _TRAFFIC_STATE["interface_baselines"] = parsed_baselines
             notified = data.get("hard_stop_notified_guilds", [])
             _TRAFFIC_STATE["hard_stop_notified_guilds"] = [str(x) for x in notified if str(x).isdigit()] if isinstance(notified, list) else []
 
@@ -359,6 +477,14 @@ def _traffic_record_bytes(amount: int, counter: str) -> bool:
     if counter not in _TRAFFIC_COUNTER_KEYS or amount <= 0:
         return not _traffic_is_blocked()
     _traffic_ensure_current_window()
+    # Refresh Linux RX/TX counters immediately at media-chunk boundaries. Otherwise a
+    # fast download burst can pass the budget between the normal background samples.
+    # This does not double-count bytes: when interface accounting is active, its delta
+    # remains the total; per-feature counters are retained for diagnostics/fallback only.
+    try:
+        _traffic_sample_network_io()
+    except Exception as exc:
+        print(f"[TrafficGuard] Immediate network sample failed: {type(exc).__name__}: {exc}", flush=True)
     with _TRAFFIC_LOCK:
         was_stopped = bool(_TRAFFIC_STATE.get("hard_stopped"))
         bucket_key = str(_traffic_bucket_id())
@@ -373,8 +499,10 @@ def _traffic_record_bytes(amount: int, counter: str) -> bool:
 
 
 def _traffic_is_blocked() -> bool:
+    """Block optional network requests once the protected reserve would be spent."""
     snapshot = _traffic_snapshot()
-    return bool(snapshot.get("hard_stopped")) or snapshot["used_bytes"] >= TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB
+    soft_limit = max(0, TRAFFIC_HARD_STOP_MIB - TRAFFIC_DOWNLOAD_RESERVE_MIB) * _TRAFFIC_MIB
+    return bool(snapshot.get("hard_stopped")) or snapshot["used_bytes"] >= soft_limit
 
 
 def _traffic_can_start_music() -> bool:
@@ -445,7 +573,7 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 # bypass paid services, DRM, private content, or service licensing restrictions.
 YTDL_OPTIONS = {
     # Prefer an audio-only format; avoid fetching video when audio is available.
-    "format": "bestaudio[abr<=128][acodec!=none]/bestaudio[acodec!=none]/best[acodec!=none]/best",
+    "format": "bestaudio[abr<=48][acodec!=none]/bestaudio[abr<=64][acodec!=none]/bestaudio[abr<=80][acodec!=none]/bestaudio[abr<=96][acodec!=none]/bestaudio[acodec!=none]/bestaudio",
     "noplaylist": True,
     "playlist_items": "1",
     "quiet": True,
@@ -1122,7 +1250,7 @@ def _opus_play_kwargs(voice) -> dict:
         kbps = int((getattr(voice.channel, "bitrate", 128000) or 128000) // 1000)
     except (TypeError, ValueError, AttributeError):
         pass
-    return {"bitrate": max(64, min(kbps, MUSIC_MAX_KBPS)), "signal_type": "music", "expected_packet_loss": 0.05}
+    return {"bitrate": max(24, min(kbps, MUSIC_MAX_KBPS)), "signal_type": "music", "expected_packet_loss": 0.05}
 
 
 async def ensure_voice(ctx: commands.Context) -> discord.VoiceClient:
@@ -1290,8 +1418,14 @@ async def traffic_guard_task():
     elapsed = min(TRAFFIC_CHECK_INTERVAL_SECONDS * 2, max(0.0, now - _TRAFFIC_LAST_VOICE_TICK))
     _TRAFFIC_LAST_VOICE_TICK = now
 
+    # Prefer container RX+TX counters, which also include Discord gateway, feed and API
+    # traffic. The voice estimate is only used if this host doesn't expose NIC counters.
+    network_sample_available = _traffic_sample_network_io()
+    with _TRAFFIC_LOCK:
+        has_interface_meter = bool(_TRAFFIC_STATE.get("interface_accounting_active")) and network_sample_available
+
     voice_bytes = 0
-    if elapsed > 0:
+    if not has_interface_meter and elapsed > 0:
         for guild in list(bot.guilds):
             voice = guild.voice_client
             if voice is None or not voice.is_connected() or not voice.is_playing():
@@ -1299,7 +1433,7 @@ async def traffic_guard_task():
             kbps = MUSIC_MAX_KBPS
             try:
                 channel_bitrate = int(getattr(voice.channel, "bitrate", 128000) or 128000) // 1000
-                kbps = max(64, min(channel_bitrate, MUSIC_MAX_KBPS))
+                kbps = max(24, min(channel_bitrate, MUSIC_MAX_KBPS))
             except (TypeError, ValueError, AttributeError):
                 pass
             voice_bytes += int(elapsed * kbps * 1000 / 8 * TRAFFIC_VOICE_OVERHEAD_FACTOR)
@@ -1347,26 +1481,39 @@ async def traffic_status_command(ctx: commands.Context):
     api_mib = snapshot["api_response_bytes"] / _TRAFFIC_MIB
     voice_mib = snapshot["voice_estimated_bytes"] / _TRAFFIC_MIB
     percent = min(100, int((used_mib / max(1, TRAFFIC_HARD_STOP_MIB)) * 100))
-    stopped = bool(snapshot.get("hard_stopped")) or used_mib >= TRAFFIC_HARD_STOP_MIB
+    stopped = (
+        bool(snapshot.get("hard_stopped"))
+        or used_mib >= TRAFFIC_HARD_STOP_MIB
+        or used_mib + TRAFFIC_DOWNLOAD_RESERVE_MIB >= TRAFFIC_HARD_STOP_MIB
+    )
     embed = discord.Embed(
         title="⬡ VAULTBOT // DAILY TRAFFIC METER",
         description=(
             f"**{used_mib:.1f} / {TRAFFIC_HARD_STOP_MIB} MiB tracked**  ·  **{percent}%**\n"
             f"{'🛑 Music protection is active.' if stopped else '🟢 Music protection is monitoring usage.'}\n"
-            "Accounting window: **rolling 24 hours**"
+            "Accounting window: **rolling 24 hours**\n"
+            + ("Counter: **container network RX + TX** (Discord, music, API and feed traffic)." if snapshot.get("interface_accounting_active") else "Counter: **tracked estimates only**; Linux network counters unavailable.")
         ),
         color=MUSIC_ERROR_COLOR if stopped else (MUSIC_WARN_COLOR if used_mib >= TRAFFIC_WARNING_MIB else MUSIC_COLOR),
     )
-    embed.add_field(
-        name="Tracked usage breakdown",
-        value=(
+    if snapshot.get("interface_accounting_active"):
+        interface_mib = snapshot.get("network_interface_bytes", 0) / _TRAFFIC_MIB
+        breakdown_value = (
+            f"🌐 Container network RX + TX: **{interface_mib:.1f} MiB**\n"
+            f"🎧 Voice egress estimate (diagnostic): **{voice_mib:.1f} MiB**\n"
+            f"⬇️ Audio downloads (diagnostic): **{download_mib:.1f} MiB**\n"
+            f"📎 Attachments (diagnostic): **{attachment_mib:.1f} MiB**\n"
+            f"API response bodies (diagnostic): **{api_mib:.1f} MiB**\n"
+            "*Diagnostics overlap with the network counter and are not added again.*"
+        )
+    else:
+        breakdown_value = (
             f"🎧 Voice egress estimate: **{voice_mib:.1f} MiB**\n"
             f"⬇️ Audio files downloaded: **{download_mib:.1f} MiB**\n"
             f"📎 Discord audio uploads received: **{attachment_mib:.1f} MiB**\n"
             f"🌐 Juice WRLD API response bodies: **{api_mib:.1f} MiB**"
-        ),
-        inline=False,
-    )
+        )
+    embed.add_field(name="Tracked usage breakdown", value=breakdown_value, inline=False)
     embed.add_field(
         name="Protection settings",
         value=(
@@ -1377,7 +1524,7 @@ async def traffic_status_command(ctx: commands.Context):
         ),
         inline=False,
     )
-    embed.set_footer(text="Estimate only: FadeHost's usage meter counts traffic this script cannot fully observe. Keep the host meter as the source of truth.")
+    embed.set_footer(text="RX+TX is measured when Linux exposes network counters; FadeHost's usage meter remains authoritative.")
     await ctx.send(embed=embed)
 
 
@@ -1572,7 +1719,7 @@ def _juicewrld_add_event_metadata(embed: discord.Embed, item: dict) -> None:
 async def juicewrld_tracker_task():
     """Poll the tracker feed and post polished updates plus distinct new-song alerts."""
     global _juicewrld_baseline_initialized
-    if not JUICEWRLD_CHANNEL_ID:
+    if not JUICEWRLD_CHANNEL_ID or _traffic_is_blocked():
         return
 
     try:
@@ -1944,7 +2091,7 @@ HELP_PAGES: list[dict] = [
             ),
             (
                 "🛡️ Daily traffic protection",
-                "Use `~traffic` to view VaultBot's persisted traffic estimate. Music downloads and voice output are tracked conservatively; at the hard-stop threshold, all music is stopped until enough older usage ages out of the rolling 24-hour window. FadeHost's own meter remains authoritative.",
+                f"Use `~traffic` to view VaultBot's rolling traffic meter. On Linux hosts with readable network counters, the bot measures container RX + TX; it pauses new music and optional network requests at {TRAFFIC_HARD_STOP_MIB - TRAFFIC_DOWNLOAD_RESERVE_MIB} MiB and stops active music at {TRAFFIC_HARD_STOP_MIB} MiB by default. Optional update feeds and AI calls also pause to protect the remaining allowance. FadeHost's own meter remains authoritative.",
             ),
             (
                 "🧭 Using this menu",
@@ -2028,7 +2175,7 @@ HELP_PAGES: list[dict] = [
             ("`/drops setup channel:<channel> [role]`", "Choose where Drops alerts are posted and optionally which role is pinged. Requires Manage Server."),
             ("`/drops add game:<name>`  •  `/drops remove game:<name>`", "Follow or unfollow a game. Use `all` with `/drops add` to follow every game in the feed."),
             ("`/drops list`  •  `/drops status`", "View this server's current Drops configuration, followed games, and the health/status of the feed checker."),
-            ("`/drops post game:<name> reward:<details> [ends] [link]`", "Manually post a campaign the feed missed. The optional link must use HTTPS. Configure `DROPS_FEED_URL` on the host for automatic feed polling; optional settings include `DROPS_POLL_MINUTES` (default 30, minimum 15) and `DROPS_DATA_FILE`. The first successful feed read establishes a baseline rather than reposting existing campaigns."),
+            ("`/drops post game:<name> reward:<details> [ends] [link]`", "Manually post a campaign the feed missed. The optional link must use HTTPS. Configure `DROPS_FEED_URL` on the host for automatic feed polling; optional settings include `DROPS_POLL_MINUTES` (default 120, minimum 60) and `DROPS_DATA_FILE`. The first successful feed read establishes a baseline rather than reposting existing campaigns."),
         ],
     },
     {
@@ -2210,6 +2357,15 @@ async def on_ready():
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    traffic_error = error if isinstance(error, TrafficBudgetError) else None
+    if isinstance(error, commands.CommandInvokeError) and isinstance(error.original, TrafficBudgetError):
+        traffic_error = error.original
+    if traffic_error is not None:
+        try:
+            await ctx.send(embed=_traffic_protection_embed(hard=_traffic_is_blocked()))
+        except discord.HTTPException:
+            pass
+        return
     if isinstance(error, commands.CommandNotFound):
         return
     if isinstance(error, commands.CheckFailure) and ctx.command and ctx.command.name in {"ban", "unban", "timeout", "untimeout"}:
@@ -3374,7 +3530,7 @@ def _jw_download_url(path, compressed=True):
     endpoint = "files/download-compressed/" if compressed else "files/download/"
     params = {"path": path}
     if compressed:
-        params["bitrate"] = "160k"
+        params["bitrate"] = JW_PLAYBACK_BITRATE
     return f"{JUICEWRLD_API_BASE}/{endpoint}?{urlencode(params)}"
 
 
@@ -3790,6 +3946,9 @@ def _juicewrld_group_buy_from_row(row):
 
 
 async def _fetch_juicewrld_group_buys():
+    # When the safety budget is reached, use the saved archive instead of a live request.
+    if _traffic_is_blocked():
+        return []
     # Keep a live lookup quick: Cloudflare may reject non-browser requests.
     timeout = aiohttp.ClientTimeout(total=8)
     headers = {
@@ -3848,6 +4007,8 @@ _JWGB_LIVE_RETRY_AT = 0.0
 
 async def _jw_get_json_url(url: str, params: Optional[dict] = None):
     """Fetch JSON from an absolute API URL without adding browser-challenge workarounds."""
+    if _traffic_is_blocked():
+        return []
     timeout = aiohttp.ClientTimeout(total=18)
     headers = {"Accept": "application/json", "User-Agent": "VaultBot/1.0 (Juice WRLD lookup)"}
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
@@ -5231,7 +5392,7 @@ async def ping(interaction: discord.Interaction):
 # SERVER MEMBER STAT CHANNELS
 # =============================================================================
 MEMBER_STATS_CATEGORY = "📊 SERVER STATS"
-MEMBER_STATS_REFRESH_MINUTES = 15
+MEMBER_STATS_REFRESH_MINUTES = 60
 
 
 def _member_stats_counts(guild: discord.Guild) -> tuple[int, int, int]:
@@ -5625,6 +5786,8 @@ _ai_http_semaphore = asyncio.Semaphore(3)
 
 async def _groq_chat_reply(user_id: int, conversation_id: int, prompt: str) -> str:
     """Ask Groq's OpenAI-compatible chat-completions API."""
+    if _traffic_is_blocked():
+        raise TrafficBudgetError("VaultBot paused optional AI requests to protect the hosting traffic budget. Try again after usage ages out.")
     if not GROQ_API_KEY:
         raise RuntimeError(
             "AI isn't configured yet. Add GROQ_API_KEY to your host environment "
@@ -6453,14 +6616,14 @@ How it works
 * /patchnotes add      follows a Steam game (Steam's public news feed, no key).
 * /patchnotes addfeed  follows Minecraft (Java/Bedrock), NVIDIA GeForce drivers
                        or Fortnite updates.
-* Every few minutes the bot checks each followed source and posts anything it
-  hasn't posted before to the subscribed channel as an embed.
+* The low-traffic default checks each followed source every two hours and posts
+  any new item to the subscribed channel as an embed.
 
 This file is self-contained. VaultBot.py loads it inside a try/except, so if
 anything in here ever fails, the rest of the bot keeps running.
 
 Optional environment variables (all have sensible defaults):
-  PATCHNOTES_POLL_MINUTES   how often to check Steam (default 20, minimum 10)
+  PATCHNOTES_POLL_MINUTES   how often to check Steam (default 120, minimum 60)
   PATCHNOTES_DATA_FILE      where subscriptions are saved
                             (default: patchnotes_data.json next to this file)
   ANTHROPIC_API_KEY         optional: lets an AI model write the "key updates" summary
@@ -6501,10 +6664,12 @@ EMBED_COLOR = discord.Color.from_rgb(0, 225, 255)  # VaultBot neon-cyan sci-fi a
 
 def _poll_minutes() -> int:
     try:
-        return max(10, int(os.getenv("PATCHNOTES_POLL_MINUTES", "20")))
+        # Two-hour default; keep at least hourly even if a previous environment
+        # setting still says 20 minutes.
+        return max(60, int(os.getenv("PATCHNOTES_POLL_MINUTES", "120")))
     except (TypeError, ValueError):
-        print("[PatchNotes] PATCHNOTES_POLL_MINUTES must be a number; using 20.")
-        return 20
+        print("[PatchNotes] PATCHNOTES_POLL_MINUTES must be a number; using 120.")
+        return 120
 
 
 POLL_MINUTES = _poll_minutes()
@@ -6555,6 +6720,8 @@ def _save() -> None:
 # Steam lookups
 # -----------------------------------------------------------------------------
 async def _get_json(url: str, params: dict):
+    if _traffic_is_blocked():
+        return {}
     timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(url, params=params, headers={"Accept": "application/json"}) as resp:
@@ -7082,6 +7249,8 @@ _digest_cache: dict = {}
 
 async def _ai_digest(appid: str, game: str, item: dict) -> Optional[dict]:
     """Optional: let an AI model write the summary. Needs ANTHROPIC_API_KEY; returns None otherwise."""
+    if _traffic_is_blocked():
+        return None
     key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not key:
         return None
@@ -7621,6 +7790,8 @@ FEEDS = {
 
 async def _fetch_items(key: str) -> list:
     """One entry point for every source: a Steam app ID or a feed key."""
+    if _traffic_is_blocked():
+        return []
     if key in FEEDS:
         return await FEEDS[key][1]()
     if key.startswith("feed:"):
@@ -7640,6 +7811,9 @@ def _remember(appid: str, gids: list) -> None:
 
 
 async def poll_once() -> None:
+    # Stop optional update polling when the safety budget is exhausted.
+    if _traffic_is_blocked():
+        return
     targets: dict = {}   # game ID -> [(server ID, subscription), ...]
     for guild_id, games in _subs.items():
         for appid, sub in games.items():
@@ -7648,6 +7822,9 @@ async def poll_once() -> None:
     changed = False
     cutoff = time.time() - MAX_AGE_DAYS * 86400
     for appid, subscribers in targets.items():
+        if _traffic_is_blocked():
+            print("[PatchNotes] Pausing remaining source checks to protect the traffic budget.", flush=True)
+            break
         try:
             items = await _fetch_items(appid)
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
@@ -7955,7 +8132,7 @@ Setup
 3. /drops status shows when the feed was last read and whether it's failing.
 
 Optional environment variables
-  DROPS_POLL_MINUTES   how often to read the feed (default 30, minimum 15)
+  DROPS_POLL_MINUTES   how often to read the feed (default 120, minimum 60)
   DROPS_DATA_FILE      where settings are saved (default: drops_data.json next to this file)
 
 Notes
@@ -7969,7 +8146,7 @@ Notes
 """
 
 DROPS_FEED_URL = os.getenv("DROPS_FEED_URL", "").strip()
-DROPS_POLL_MINUTES = max(15, _positive_int_env("DROPS_POLL_MINUTES", 30))
+DROPS_POLL_MINUTES = max(60, _positive_int_env("DROPS_POLL_MINUTES", 120))
 DROPS_DATA_FILE = Path(os.getenv(
     "DROPS_DATA_FILE",
     str(Path(__file__).resolve().parent / "drops_data.json"),
@@ -7979,7 +8156,7 @@ DROPS_MAX_POSTS_PER_POLL = 10   # cap a burst of new entries
 DROPS_MAX_GAMES_PER_SERVER = 50
 DROPS_SEEN_LIMIT = 1000         # how many entry IDs to remember
 DROPS_FAIL_ALERT_AFTER = 6      # consecutive failures before the owner is DM'd
-DROPS_MAX_FEED_BYTES = 2_000_000
+DROPS_MAX_FEED_BYTES = 500_000
 DROPS_COLOR = discord.Color.from_rgb(145, 70, 255)
 _DROPS_ALL = "all"
 
@@ -8220,7 +8397,7 @@ async def _drops_poll_once() -> None:
     global _drops_baseline, _drops_fail_count, _drops_owner_notified
     global _drops_last_ok, _drops_last_error
 
-    if not DROPS_FEED_URL:
+    if not DROPS_FEED_URL or _traffic_is_blocked():
         return
 
     try:
