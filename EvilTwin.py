@@ -39,6 +39,7 @@ import signal
 import sys
 import tempfile
 import time
+import threading
 import difflib
 from collections import deque
 from dataclasses import dataclass
@@ -88,8 +89,12 @@ MAX_VOLUME_PERCENT = 200  # 100 = original loudness; above that the audio is amp
 # console: repeated "406" lines mean the API rejects it and every song falls back to the slower original file.
 JW_PLAYBACK_BITRATE = "160k"
 # --- Traffic savers (hosting plans meter inbound + outbound data together) ---------------------------
-# Voice audio sent to Discord counts as outbound traffic: ~43 MB/hour at 96 kbps, ~58 MB/hour at 128 kbps.
-MUSIC_MAX_KBPS = 96
+# Use a lower 64 kbps encoder target by default to reduce Discord voice egress.
+# Owners can set VAULTBOT_MUSIC_MAX_KBPS=96 if they prefer higher quality over more play time.
+try:
+    MUSIC_MAX_KBPS = min(96, max(64, int(os.getenv("VAULTBOT_MUSIC_MAX_KBPS", "64"))))
+except (TypeError, ValueError):
+    MUSIC_MAX_KBPS = 64
 # Radio skips audio files bigger than this (big WAVs waste data and usually time out anyway).
 JW_RADIO_MAX_MB = 15
 # Leave the voice channel after this many seconds with no humans in it (0 = never leave).
@@ -116,7 +121,7 @@ def _positive_int_env(name: str, default: int) -> int:
         return default
 
 
-JUICEWRLD_POLL_MINUTES = _positive_int_env("JUICEWRLD_POLL_MINUTES", 5)
+JUICEWRLD_POLL_MINUTES = max(10, _positive_int_env("JUICEWRLD_POLL_MINUTES", 15))
 JUICEWRLD_STATE_FILE = Path(os.getenv(
     "JUICEWRLD_STATE_FILE",
     str(Path(tempfile.gettempdir()) / "juicewrld_seen.json")
@@ -128,6 +133,290 @@ JUICEWRLD_CATALOG_CACHE_FILE = Path(os.getenv(
     "/data/juicewrld_audio_catalog.json",
 ))
 
+
+# =============================================================================
+# DAILY TRAFFIC SAFETY GUARD
+# =============================================================================
+# FadeHost's full network meter is not exposed to this Python process. This
+# guard conservatively tracks downloaded media/API response bodies and estimates
+# Discord voice egress, then stops all music before the provider's nominal 1 GB
+# allowance should be approached. It is deliberately not presented as an exact
+# replacement for the host's traffic meter.
+_TRAFFIC_MIB = 1024 * 1024
+# Default hard stop at 500 MiB (about 524 MB decimal), leaving roughly 476 MB
+# of margin beneath a nominal 1 GB provider cap for traffic this process cannot see.
+# The environment override is intentionally capped at 600 MiB for extra safety.
+TRAFFIC_HARD_STOP_MIB = min(600, _positive_int_env("VAULTBOT_TRAFFIC_HARD_STOP_MIB", 500))
+TRAFFIC_WARNING_MIB = min(
+    max(1, TRAFFIC_HARD_STOP_MIB - 1),
+    _positive_int_env("VAULTBOT_TRAFFIC_WARNING_MIB", 350),
+)
+TRAFFIC_MAX_TRACK_DOWNLOAD_MIB = min(
+    25, _positive_int_env("VAULTBOT_TRAFFIC_MAX_TRACK_DOWNLOAD_MIB", 25)
+)
+TRAFFIC_DOWNLOAD_RESERVE_MIB = min(
+    100, _positive_int_env("VAULTBOT_TRAFFIC_DOWNLOAD_RESERVE_MIB", 30)
+)
+TRAFFIC_VOICE_OVERHEAD_FACTOR = 1.35
+TRAFFIC_CHECK_INTERVAL_SECONDS = 5
+# 5-minute buckets provide a conservative rolling 24-hour window without
+# keeping thousands of per-packet records in memory or on disk.
+_TRAFFIC_BUCKET_SECONDS = 300
+_TRAFFIC_BUCKETS_TO_KEEP = (24 * 60 * 60 // _TRAFFIC_BUCKET_SECONDS) + 1
+
+TRAFFIC_STATE_FILE = Path(os.getenv("VAULTBOT_TRAFFIC_STATE_FILE", "/data/vaultbot_traffic_state.json"))
+_TRAFFIC_FALLBACK_STATE_FILE = Path(tempfile.gettempdir()) / "vaultbot_traffic_state.json"
+_TRAFFIC_STATE_PATH = TRAFFIC_STATE_FILE
+_TRAFFIC_COUNTER_KEYS = (
+    "audio_download_bytes",
+    "attachment_download_bytes",
+    "api_response_bytes",
+    "voice_estimated_bytes",
+)
+_TRAFFIC_LOCK = threading.RLock()
+_TRAFFIC_LOADED = False
+_TRAFFIC_LAST_SAVE_MONO = 0.0
+_TRAFFIC_STATE = {
+    "buckets": {},
+    "audio_download_bytes": 0,
+    "attachment_download_bytes": 0,
+    "api_response_bytes": 0,
+    "voice_estimated_bytes": 0,
+    "warning_sent": False,
+    "hard_stopped": False,
+    "hard_stop_notified_guilds": [],
+}
+
+
+class TrafficBudgetError(RuntimeError):
+    """Raised when a new media transfer would spend the reserved traffic budget."""
+
+
+def _traffic_bucket_id() -> int:
+    return int(time.time() // _TRAFFIC_BUCKET_SECONDS)
+
+
+def _traffic_save_locked(force: bool = False) -> None:
+    """Persist the small rolling meter atomically; throttle writes during active playback."""
+    global _TRAFFIC_LAST_SAVE_MONO, _TRAFFIC_STATE_PATH
+    now = time.monotonic()
+    if not force and now - _TRAFFIC_LAST_SAVE_MONO < 30:
+        return
+    payload = dict(_TRAFFIC_STATE)
+    payload["buckets"] = {
+        str(key): dict(value) for key, value in _TRAFFIC_STATE.get("buckets", {}).items()
+        if isinstance(value, dict)
+    }
+    payload["hard_stop_notified_guilds"] = list(_TRAFFIC_STATE.get("hard_stop_notified_guilds", []))
+    candidates = []
+    for candidate in (_TRAFFIC_STATE_PATH, TRAFFIC_STATE_FILE, _TRAFFIC_FALLBACK_STATE_FILE):
+        if candidate not in candidates:
+            candidates.append(candidate)
+    last_error = None
+    for candidate in candidates:
+        try:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            temporary = candidate.with_suffix(candidate.suffix + ".tmp")
+            temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+            temporary.replace(candidate)
+            _TRAFFIC_STATE_PATH = candidate
+            _TRAFFIC_LAST_SAVE_MONO = now
+            return
+        except OSError as exc:
+            last_error = exc
+    # Without persisted state, a restart could reset usage. Fail closed instead.
+    _TRAFFIC_STATE["hard_stopped"] = True
+    if not getattr(_traffic_save_locked, "warned", False):
+        print(f"[TrafficGuard] Could not persist traffic state; failing closed and disabling music: {last_error}", flush=True)
+        _traffic_save_locked.warned = True
+
+
+def _traffic_refresh_totals_locked() -> int:
+    """Prune old buckets and update aggregate counters for the current rolling window."""
+    buckets = _TRAFFIC_STATE.setdefault("buckets", {})
+    current_bucket = _traffic_bucket_id()
+    oldest_bucket = current_bucket - (_TRAFFIC_BUCKETS_TO_KEEP - 1)
+    for key in list(buckets):
+        try:
+            bucket_id = int(key)
+        except (TypeError, ValueError):
+            buckets.pop(key, None)
+            continue
+        if bucket_id < oldest_bucket or not isinstance(buckets.get(key), dict):
+            buckets.pop(key, None)
+
+    total = 0
+    for counter in _TRAFFIC_COUNTER_KEYS:
+        value = 0
+        for bucket in buckets.values():
+            try:
+                value += max(0, int(bucket.get(counter, 0) or 0))
+            except (TypeError, ValueError, AttributeError):
+                continue
+        _TRAFFIC_STATE[counter] = value
+        total += value
+    return total
+
+
+def _traffic_load_state() -> None:
+    """Load persisted rolling usage once; legacy counters are migrated conservatively."""
+    global _TRAFFIC_LOADED, _TRAFFIC_STATE_PATH
+    with _TRAFFIC_LOCK:
+        if _TRAFFIC_LOADED:
+            return
+        data = None
+        for candidate in (TRAFFIC_STATE_FILE, _TRAFFIC_FALLBACK_STATE_FILE):
+            try:
+                loaded = json.loads(candidate.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+                    _TRAFFIC_STATE_PATH = candidate
+                    break
+            except FileNotFoundError:
+                continue
+            except (OSError, json.JSONDecodeError, TypeError) as exc:
+                print(f"[TrafficGuard] State file could not be read ({candidate}): {exc}", flush=True)
+
+        _TRAFFIC_STATE.clear()
+        _TRAFFIC_STATE.update({
+            "buckets": {},
+            "audio_download_bytes": 0,
+            "attachment_download_bytes": 0,
+            "api_response_bytes": 0,
+            "voice_estimated_bytes": 0,
+            "warning_sent": False,
+            "hard_stopped": False,
+            "hard_stop_notified_guilds": [],
+        })
+        if isinstance(data, dict):
+            raw_buckets = data.get("buckets")
+            if isinstance(raw_buckets, dict):
+                _TRAFFIC_STATE["buckets"] = {
+                    str(key): dict(value) for key, value in raw_buckets.items()
+                    if str(key).lstrip("-").isdigit() and isinstance(value, dict)
+                }
+            else:
+                # If a prior build stored daily totals instead of buckets, treat
+                # them as new usage instead of silently granting a fresh allowance.
+                legacy_total = 0
+                legacy_values = {}
+                for key in _TRAFFIC_COUNTER_KEYS:
+                    try:
+                        legacy_values[key] = max(0, int(data.get(key, 0) or 0))
+                    except (TypeError, ValueError):
+                        legacy_values[key] = 0
+                    legacy_total += legacy_values[key]
+                if legacy_total:
+                    _TRAFFIC_STATE["buckets"][str(_traffic_bucket_id())] = legacy_values
+            _TRAFFIC_STATE["warning_sent"] = bool(data.get("warning_sent", False))
+            _TRAFFIC_STATE["hard_stopped"] = bool(data.get("hard_stopped", False))
+            notified = data.get("hard_stop_notified_guilds", [])
+            _TRAFFIC_STATE["hard_stop_notified_guilds"] = [str(x) for x in notified if str(x).isdigit()] if isinstance(notified, list) else []
+
+        used = _traffic_refresh_totals_locked()
+        if used >= TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB:
+            _TRAFFIC_STATE["hard_stopped"] = True
+        _TRAFFIC_LOADED = True
+        _traffic_save_locked(force=True)
+        print(
+            f"[TrafficGuard] Loaded {used / _TRAFFIC_MIB:.1f}/{TRAFFIC_HARD_STOP_MIB} MiB in the rolling 24-hour window.",
+            flush=True,
+        )
+
+
+def _traffic_ensure_current_window() -> None:
+    _traffic_load_state()
+    with _TRAFFIC_LOCK:
+        used = _traffic_refresh_totals_locked()
+        cap = TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB
+        reserve = TRAFFIC_DOWNLOAD_RESERVE_MIB * _TRAFFIC_MIB
+        warning = TRAFFIC_WARNING_MIB * _TRAFFIC_MIB
+        if used >= cap:
+            _TRAFFIC_STATE["hard_stopped"] = True
+        elif _TRAFFIC_STATE.get("hard_stopped") and used + reserve < cap:
+            # Usage has aged out of the rolling window far enough to safely allow music again.
+            _TRAFFIC_STATE["hard_stopped"] = False
+            _TRAFFIC_STATE["hard_stop_notified_guilds"] = []
+            _TRAFFIC_STATE["warning_sent"] = used >= warning
+            print(f"[TrafficGuard] Rolling usage fell to {used / _TRAFFIC_MIB:.1f} MiB; music may resume.", flush=True)
+            _traffic_save_locked(force=True)
+        elif used < warning:
+            _TRAFFIC_STATE["warning_sent"] = False
+        _traffic_save_locked()
+
+
+def _traffic_snapshot() -> dict:
+    _traffic_ensure_current_window()
+    with _TRAFFIC_LOCK:
+        snapshot = dict(_TRAFFIC_STATE)
+        snapshot["hard_stop_notified_guilds"] = list(_TRAFFIC_STATE.get("hard_stop_notified_guilds", []))
+        snapshot["used_bytes"] = _traffic_refresh_totals_locked()
+        return snapshot
+
+
+def _traffic_record_bytes(amount: int, counter: str) -> bool:
+    """Account for known bytes in the current 5-minute bucket."""
+    if counter not in _TRAFFIC_COUNTER_KEYS or amount <= 0:
+        return not _traffic_is_blocked()
+    _traffic_ensure_current_window()
+    with _TRAFFIC_LOCK:
+        was_stopped = bool(_TRAFFIC_STATE.get("hard_stopped"))
+        bucket_key = str(_traffic_bucket_id())
+        buckets = _TRAFFIC_STATE.setdefault("buckets", {})
+        bucket = buckets.setdefault(bucket_key, {key: 0 for key in _TRAFFIC_COUNTER_KEYS})
+        bucket[counter] = max(0, int(bucket.get(counter, 0) or 0)) + int(amount)
+        used = _traffic_refresh_totals_locked()
+        if used >= TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB:
+            _TRAFFIC_STATE["hard_stopped"] = True
+        _traffic_save_locked(force=(not was_stopped and _TRAFFIC_STATE["hard_stopped"]))
+        return not bool(_TRAFFIC_STATE.get("hard_stopped"))
+
+
+def _traffic_is_blocked() -> bool:
+    snapshot = _traffic_snapshot()
+    return bool(snapshot.get("hard_stopped")) or snapshot["used_bytes"] >= TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB
+
+
+def _traffic_can_start_music() -> bool:
+    snapshot = _traffic_snapshot()
+    cap = TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB
+    reserve = TRAFFIC_DOWNLOAD_RESERVE_MIB * _TRAFFIC_MIB
+    return not snapshot.get("hard_stopped") and snapshot["used_bytes"] + reserve < cap
+
+
+def _traffic_download_allowance_bytes() -> int:
+    """Return a per-track cap while leaving room for ongoing voice and untracked traffic."""
+    snapshot = _traffic_snapshot()
+    if snapshot.get("hard_stopped"):
+        return 0
+    cap = TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB
+    reserve = TRAFFIC_DOWNLOAD_RESERVE_MIB * _TRAFFIC_MIB
+    remaining = cap - snapshot["used_bytes"] - reserve
+    if remaining < 1 * _TRAFFIC_MIB:
+        return 0
+    return min(TRAFFIC_MAX_TRACK_DOWNLOAD_MIB * _TRAFFIC_MIB, remaining)
+
+
+def _traffic_can_download(size_bytes: int) -> bool:
+    snapshot = _traffic_snapshot()
+    if snapshot.get("hard_stopped"):
+        return False
+    remaining = TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB - snapshot["used_bytes"]
+    reserve = TRAFFIC_DOWNLOAD_RESERVE_MIB * _TRAFFIC_MIB
+    return int(size_bytes) >= 0 and int(size_bytes) + reserve <= remaining
+
+
+def _traffic_protection_embed(hard: bool = False) -> discord.Embed:
+    snapshot = _traffic_snapshot()
+    used_mib = snapshot["used_bytes"] / _TRAFFIC_MIB
+    title = "🛡️ DAILY TRAFFIC PROTECTION ACTIVE" if hard or snapshot.get("hard_stopped") else "⚠️ DAILY MUSIC BUDGET NEAR LIMIT"
+    description = (
+        f"Tracked estimate: **{used_mib:.1f} / {TRAFFIC_HARD_STOP_MIB} MiB**\n"
+        "VaultBot is limiting music to keep a safety margin below FadeHost's daily allowance. "
+        "Music downloads resume as older traffic ages out of the rolling 24-hour window.\n\n"
+        "Check `~traffic` for the breakdown."
+    )
+    return discord.Embed(title=title, description=description, color=MUSIC_ERROR_COLOR if hard else MUSIC_WARN_COLOR)
 
 # =============================================================================
 # 3. BOT SETUP
@@ -156,7 +445,7 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 # bypass paid services, DRM, private content, or service licensing restrictions.
 YTDL_OPTIONS = {
     # Prefer an audio-only format; avoid fetching video when audio is available.
-    "format": "bestaudio[acodec!=none]/bestaudio/best[acodec!=none]/best",
+    "format": "bestaudio[abr<=128][acodec!=none]/bestaudio[acodec!=none]/best[acodec!=none]/best",
     "noplaylist": True,
     "playlist_items": "1",
     "quiet": True,
@@ -168,8 +457,8 @@ YTDL_OPTIONS = {
     # Keep yt-dlp's disk cache off and prevent concurrent fragment buffering.
     "cachedir": False,
     "concurrent_fragment_downloads": 1,
-    "retries": 2,
-    "fragment_retries": 2,
+    "retries": 1,
+    "fragment_retries": 1,
     "socket_timeout": 12,
 }
 
@@ -521,6 +810,9 @@ async def extract_track(query: str, requester: str, on_found=None) -> Track:
 
     def _extract(query: str, notify_found=None):
         folder = tempfile.mkdtemp(prefix="vaultbot_audio_")
+        download_allowance = _traffic_download_allowance_bytes()
+        if download_allowance <= 0:
+            raise TrafficBudgetError("VaultBot's traffic safety budget is nearly exhausted; music downloads are paused until older usage ages out of the rolling 24-hour window.")
         options = dict(YTDL_OPTIONS)
         options.update({
             "outtmpl": str(Path(folder) / "%(id)s.%(ext)s"),
@@ -528,12 +820,33 @@ async def extract_track(query: str, requester: str, on_found=None) -> Track:
             "noplaylist": True,
             "playlist_items": "1",
             "skip_download": False,
+            # This is advisory for extractors that know the source size; the hook
+            # below is the live guard for sources that don't publish a file size.
+            "max_filesize": int(download_allowance),
         })
         found_notified = False
+        accounted_downloaded_bytes = 0
 
         def progress_hook(progress):
-            nonlocal found_notified
-            if found_notified or progress.get("status") != "downloading" or notify_found is None:
+            nonlocal found_notified, accounted_downloaded_bytes
+            status = progress.get("status")
+            if status in {"downloading", "finished"}:
+                try:
+                    downloaded = max(0, int(progress.get("downloaded_bytes") or 0))
+                except (TypeError, ValueError):
+                    downloaded = 0
+                if downloaded > accounted_downloaded_bytes:
+                    delta = downloaded - accounted_downloaded_bytes
+                    accounted_downloaded_bytes = downloaded
+                    if not _traffic_record_bytes(delta, "audio_download_bytes"):
+                        raise yt_dlp.utils.DownloadError(
+                            "VaultBot daily traffic safety budget reached; audio download aborted."
+                        )
+                    if accounted_downloaded_bytes > download_allowance:
+                        raise yt_dlp.utils.DownloadError(
+                            f"VaultBot per-track download allowance exhausted ({download_allowance // _TRAFFIC_MIB} MiB); download aborted."
+                        )
+            if found_notified or status != "downloading" or notify_found is None:
                 return
             info = progress.get("info_dict") or {}
             title = str(info.get("title") or "").strip()
@@ -548,8 +861,8 @@ async def extract_track(query: str, requester: str, on_found=None) -> Track:
             except Exception as hook_exc:
                 print(f"[music status] Could not update found-song embed: {hook_exc}", flush=True)
 
-        if on_found is not None:
-            options["progress_hooks"] = list(options.get("progress_hooks") or []) + [progress_hook]
+        # Count downloads even when there is no early-status callback.
+        options["progress_hooks"] = list(options.get("progress_hooks") or []) + [progress_hook]
 
         try:
             diag("yt-dlp: starting one-pass search/extraction/download")
@@ -594,6 +907,21 @@ async def extract_track(query: str, requester: str, on_found=None) -> Track:
                 if not candidates:
                     raise ValueError("yt-dlp did not produce an audio file.")
                 path = str(candidates[0])
+
+            # Some extractors don't emit byte progress. Count the final file size
+            # only when the hook did not already account for those bytes.
+            try:
+                final_size = Path(path).stat().st_size
+            except OSError:
+                final_size = 0
+            if final_size > accounted_downloaded_bytes:
+                if not _traffic_record_bytes(final_size - accounted_downloaded_bytes, "audio_download_bytes"):
+                    raise TrafficBudgetError("VaultBot daily traffic safety budget reached; track was discarded.")
+                accounted_downloaded_bytes = final_size
+            if accounted_downloaded_bytes > download_allowance:
+                raise TrafficBudgetError(
+                    f"This source exceeded VaultBot's {download_allowance // _TRAFFIC_MIB} MiB per-track transfer allowance."
+                )
 
             diag("yt-dlp: download finished")
             return {
@@ -656,6 +984,9 @@ async def update_now_playing(ctx: commands.Context, track: Track) -> None:
 async def play_next(ctx: commands.Context) -> None:
     """Start the next item. Called after a track ends."""
     if not ctx.guild:
+        return
+    if _traffic_is_blocked():
+        await _traffic_stop_all_music()
         return
     guild_id = ctx.guild.id
     async with get_lock(guild_id):
@@ -814,6 +1145,17 @@ async def queue_track(
     status_message: Optional[discord.Message] = None,
 ) -> None:
     guild_id = ctx.guild.id
+    if _traffic_is_blocked():
+        clean_temp_file(track.local_path)
+        if status_message is not None:
+            await _set_music_status(
+                ctx, status_message, "🛡️ Daily traffic protection active",
+                "The daily traffic safety threshold was reached before this track could be queued. Music is paused until older usage ages out of the rolling window.",
+                color=discord.Color.red().value,
+            )
+        else:
+            await ctx.send(embed=_traffic_protection_embed(hard=True))
+        return
     get_queue(guild_id).append(track)
     queue_position = len(get_queue(guild_id))
     if status_message is not None:
@@ -836,6 +1178,207 @@ async def queue_track(
     voice = ctx.guild.voice_client
     if voice and not voice.is_playing() and not voice.is_paused():
         await play_next(ctx)
+
+
+
+
+# ---- Enforce the daily traffic budget and estimate voice egress ----
+_TRAFFIC_LAST_VOICE_TICK = 0.0
+
+
+async def _traffic_send_notice(guild_id: int, embed: discord.Embed) -> None:
+    message = now_playing_messages.get(guild_id)
+    channel = getattr(message, "channel", None) if message is not None else None
+    if channel is not None:
+        try:
+            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except (discord.HTTPException, discord.Forbidden, AttributeError):
+            pass
+
+
+async def _traffic_stop_all_music() -> None:
+    """Stop playback/queues across all servers once the tracked safety budget is spent."""
+    for guild in list(bot.guilds):
+        guild_id = guild.id
+        voice = guild.voice_client
+        queued = get_queue(guild_id)
+        has_music = bool(
+            voice is not None or queued or guild_id in current_tracks
+            or guild_id in jw_radio_active or guild_id in jw_radio_starting
+        )
+        if not has_music:
+            continue
+
+        # Reserve the one-time notice before awaiting voice disconnects or sends;
+        # the voice player's after-callback can re-enter this function concurrently.
+        with _TRAFFIC_LOCK:
+            notified_now = set(str(x) for x in _TRAFFIC_STATE.get("hard_stop_notified_guilds", []))
+            already_notified = str(guild_id) in notified_now
+            if not already_notified:
+                notified_now.add(str(guild_id))
+                _TRAFFIC_STATE["hard_stop_notified_guilds"] = sorted(notified_now)
+                _traffic_save_locked(force=True)
+        async with get_lock(guild_id):
+            voice = guild.voice_client
+            pending = list(get_queue(guild_id))
+            get_queue(guild_id).clear()
+            for pending_track in pending:
+                clean_temp_file(pending_track.local_path)
+            current = current_tracks.pop(guild_id, None)
+            if current:
+                clean_temp_file(current.local_path)
+            jw_radio_active.discard(guild_id)
+            jw_radio_starting.discard(guild_id)
+            loop_modes[guild_id] = "off"
+            if voice is not None:
+                try:
+                    if voice.is_playing() or voice.is_paused():
+                        voice.stop()
+                except Exception:
+                    pass
+                try:
+                    await voice.disconnect(force=True)
+                except TypeError:
+                    try:
+                        await voice.disconnect()
+                    except (discord.HTTPException, RuntimeError):
+                        pass
+                except (discord.HTTPException, RuntimeError):
+                    pass
+
+        if not already_notified:
+            await _traffic_send_notice(
+                guild_id,
+                discord.Embed(
+                    title="🛡️ VAULTBOT // DAILY TRAFFIC GUARD",
+                    description=(
+                        f"Tracked usage reached the **{TRAFFIC_HARD_STOP_MIB} MiB safety threshold**.\n"
+                        "Music playback has been stopped, queues cleared, and new music downloads are paused "
+                        "until enough older usage ages out of the rolling 24-hour window. This leaves a reserve below FadeHost's nominal 1 GB/day cap.\n\n"
+                        "Use `~traffic` to view the estimate. The host's own meter remains authoritative."
+                    ),
+                    color=MUSIC_ERROR_COLOR,
+                ),
+            )
+
+
+async def _traffic_send_warning() -> None:
+    snapshot = _traffic_snapshot()
+    used_mib = snapshot["used_bytes"] / _TRAFFIC_MIB
+    embed = discord.Embed(
+        title="⚠️ VAULTBOT // TRAFFIC WARNING",
+        description=(
+            f"Tracked daily usage is **{used_mib:.1f} MiB**. The hard stop is **{TRAFFIC_HARD_STOP_MIB} MiB**.\n"
+            "VaultBot will automatically stop music and refuse new audio downloads at the safety threshold.\n"
+            "Use `~traffic` to see the tracked breakdown. The window rolls over 24 hours."
+        ),
+        color=MUSIC_WARN_COLOR,
+    )
+    for guild in list(bot.guilds):
+        if guild.voice_client is None and not get_queue(guild.id) and guild.id not in current_tracks:
+            continue
+        await _traffic_send_notice(guild.id, embed)
+
+
+@tasks.loop(seconds=TRAFFIC_CHECK_INTERVAL_SECONDS)
+async def traffic_guard_task():
+    """Count active voice egress conservatively and stop music on budget exhaustion."""
+    global _TRAFFIC_LAST_VOICE_TICK
+    now = time.monotonic()
+    if _TRAFFIC_LAST_VOICE_TICK <= 0:
+        _TRAFFIC_LAST_VOICE_TICK = now
+    elapsed = min(TRAFFIC_CHECK_INTERVAL_SECONDS * 2, max(0.0, now - _TRAFFIC_LAST_VOICE_TICK))
+    _TRAFFIC_LAST_VOICE_TICK = now
+
+    voice_bytes = 0
+    if elapsed > 0:
+        for guild in list(bot.guilds):
+            voice = guild.voice_client
+            if voice is None or not voice.is_connected() or not voice.is_playing():
+                continue
+            kbps = MUSIC_MAX_KBPS
+            try:
+                channel_bitrate = int(getattr(voice.channel, "bitrate", 128000) or 128000) // 1000
+                kbps = max(64, min(channel_bitrate, MUSIC_MAX_KBPS))
+            except (TypeError, ValueError, AttributeError):
+                pass
+            voice_bytes += int(elapsed * kbps * 1000 / 8 * TRAFFIC_VOICE_OVERHEAD_FACTOR)
+    if voice_bytes:
+        _traffic_record_bytes(voice_bytes, "voice_estimated_bytes")
+
+    snapshot = _traffic_snapshot()
+    used_bytes = snapshot["used_bytes"]
+    warning_bytes = TRAFFIC_WARNING_MIB * _TRAFFIC_MIB
+    hard_bytes = TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB
+    if used_bytes >= warning_bytes and not snapshot.get("warning_sent"):
+        with _TRAFFIC_LOCK:
+            if not _TRAFFIC_STATE.get("warning_sent"):
+                _TRAFFIC_STATE["warning_sent"] = True
+                _traffic_save_locked(force=True)
+                should_warn = True
+            else:
+                should_warn = False
+        if should_warn:
+            print(f"[TrafficGuard] Warning threshold reached at {used_bytes / _TRAFFIC_MIB:.1f} MiB.", flush=True)
+            await _traffic_send_warning()
+
+    if snapshot.get("hard_stopped") or used_bytes >= hard_bytes:
+        if not snapshot.get("hard_stopped"):
+            _traffic_record_bytes(0, "voice_estimated_bytes")
+            with _TRAFFIC_LOCK:
+                _TRAFFIC_STATE["hard_stopped"] = True
+                _traffic_save_locked(force=True)
+        await _traffic_stop_all_music()
+
+
+@traffic_guard_task.before_loop
+async def before_traffic_guard_task():
+    await bot.wait_until_ready()
+    _traffic_load_state()
+
+
+@bot.command(name="traffic", aliases=["bandwidth"])
+async def traffic_status_command(ctx: commands.Context):
+    """Show the conservative, persisted daily traffic estimate."""
+    snapshot = _traffic_snapshot()
+    used_mib = snapshot["used_bytes"] / _TRAFFIC_MIB
+    download_mib = snapshot["audio_download_bytes"] / _TRAFFIC_MIB
+    attachment_mib = snapshot["attachment_download_bytes"] / _TRAFFIC_MIB
+    api_mib = snapshot["api_response_bytes"] / _TRAFFIC_MIB
+    voice_mib = snapshot["voice_estimated_bytes"] / _TRAFFIC_MIB
+    percent = min(100, int((used_mib / max(1, TRAFFIC_HARD_STOP_MIB)) * 100))
+    stopped = bool(snapshot.get("hard_stopped")) or used_mib >= TRAFFIC_HARD_STOP_MIB
+    embed = discord.Embed(
+        title="⬡ VAULTBOT // DAILY TRAFFIC METER",
+        description=(
+            f"**{used_mib:.1f} / {TRAFFIC_HARD_STOP_MIB} MiB tracked**  ·  **{percent}%**\n"
+            f"{'🛑 Music protection is active.' if stopped else '🟢 Music protection is monitoring usage.'}\n"
+            "Accounting window: **rolling 24 hours**"
+        ),
+        color=MUSIC_ERROR_COLOR if stopped else (MUSIC_WARN_COLOR if used_mib >= TRAFFIC_WARNING_MIB else MUSIC_COLOR),
+    )
+    embed.add_field(
+        name="Tracked usage breakdown",
+        value=(
+            f"🎧 Voice egress estimate: **{voice_mib:.1f} MiB**\n"
+            f"⬇️ Audio files downloaded: **{download_mib:.1f} MiB**\n"
+            f"📎 Discord audio uploads received: **{attachment_mib:.1f} MiB**\n"
+            f"🌐 Juice WRLD API response bodies: **{api_mib:.1f} MiB**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Protection settings",
+        value=(
+            f"Warning: **{TRAFFIC_WARNING_MIB} MiB**\n"
+            f"Hard stop: **{TRAFFIC_HARD_STOP_MIB} MiB**\n"
+            f"Max per-track download: **{TRAFFIC_MAX_TRACK_DOWNLOAD_MIB} MiB**\n"
+            "Accounting window: **rolling 24 hours**"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Estimate only: FadeHost's usage meter counts traffic this script cannot fully observe. Keep the host meter as the source of truth.")
+    await ctx.send(embed=embed)
 
 
 # =============================================================================
@@ -893,6 +1436,8 @@ async def _juicewrld_api_get(
         sock_connect=min(20, timeout_seconds),
         sock_read=min(40, timeout_seconds),
     )
+    if _traffic_is_blocked():
+        raise TrafficBudgetError("VaultBot's traffic safety budget has been reached; optional API lookups are paused until older usage ages out of the rolling 24-hour window.")
     headers = {"Accept": "application/json"}
     if JUICEWRLD_API_KEY:
         headers["X-API-Key"] = JUICEWRLD_API_KEY
@@ -905,7 +1450,12 @@ async def _juicewrld_api_get(
                     f"{JUICEWRLD_API_BASE}/{path.lstrip('/')}", params=params
                 ) as response:
                     response.raise_for_status()
-                    return await response.json(content_type=None)
+                    body = await response.read()
+                    if not _traffic_record_bytes(len(body), "api_response_bytes"):
+                        raise TrafficBudgetError("VaultBot's daily traffic safety budget has been reached; API response was not processed.")
+                    return json.loads(body.decode("utf-8-sig"))
+        except TrafficBudgetError:
+            raise
         except aiohttp.ClientResponseError as exc:
             # Retry server-side errors, but don't keep retrying invalid requests/auth failures.
             if exc.status < 500:
@@ -1393,6 +1943,10 @@ HELP_PAGES: list[dict] = [
                 "command on the earlier pages.",
             ),
             (
+                "🛡️ Daily traffic protection",
+                "Use `~traffic` to view VaultBot's persisted traffic estimate. Music downloads and voice output are tracked conservatively; at the hard-stop threshold, all music is stopped until enough older usage ages out of the rolling 24-hour window. FadeHost's own meter remains authoritative.",
+            ),
+            (
                 "🧭 Using this menu",
                 "Only the person who opened the menu can use its buttons. It "
                 f"stops responding after 2 minutes, so just run `{PREFIX}help` "
@@ -1474,7 +2028,7 @@ HELP_PAGES: list[dict] = [
             ("`/drops setup channel:<channel> [role]`", "Choose where Drops alerts are posted and optionally which role is pinged. Requires Manage Server."),
             ("`/drops add game:<name>`  •  `/drops remove game:<name>`", "Follow or unfollow a game. Use `all` with `/drops add` to follow every game in the feed."),
             ("`/drops list`  •  `/drops status`", "View this server's current Drops configuration, followed games, and the health/status of the feed checker."),
-            ("`/drops post game:<name> reward:<details> [ends] [link]`", "Manually post a campaign the feed missed. The optional link must use HTTPS. Configure `DROPS_FEED_URL` on the host for automatic feed polling; optional settings include `DROPS_POLL_MINUTES` (default 15, minimum 5) and `DROPS_DATA_FILE`. The first successful feed read establishes a baseline rather than reposting existing campaigns."),
+            ("`/drops post game:<name> reward:<details> [ends] [link]`", "Manually post a campaign the feed missed. The optional link must use HTTPS. Configure `DROPS_FEED_URL` on the host for automatic feed polling; optional settings include `DROPS_POLL_MINUTES` (default 30, minimum 15) and `DROPS_DATA_FILE`. The first successful feed read establishes a baseline rather than reposting existing campaigns."),
         ],
     },
     {
@@ -1622,6 +2176,9 @@ async def send_help(ctx: commands.Context, topic: str = "") -> None:
 @bot.event
 async def on_ready():
     print(f"Bot is online as {bot.user}")
+    _traffic_load_state()
+    if not traffic_guard_task.is_running():
+        traffic_guard_task.start()
     if not member_stats_refresh_task.is_running():
         member_stats_refresh_task.start()
     try:
@@ -2217,6 +2774,8 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
     """Play a song name, supported URL, or attached MP3/WAV/Opus file."""
     if not ctx.guild:
         return await ctx.send("Use this command inside a server.")
+    if not _traffic_can_start_music():
+        return await ctx.send(embed=_traffic_protection_embed(hard=_traffic_is_blocked()))
     if ctx.guild.id in jw_radio_active:
         return await ctx.send(
             f"📻 **Juice WRLD Radio is active** in this server. Disable it with `~jwradio off` "
@@ -2248,12 +2807,27 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
             return await _set_music_status(ctx, status_message, "❌ Unsupported audio file", "Attach an MP3, WAV, Opus, OGG, M4A, or FLAC audio file.", color=discord.Color.red().value)
         if attachment.size > MAX_UPLOAD_MB * 1024 * 1024:
             return await _set_music_status(ctx, status_message, "❌ File is too large", f"That file is over the bot's {MAX_UPLOAD_MB} MB safety limit.", color=discord.Color.red().value)
+        if not _traffic_can_download(attachment.size):
+            return await _set_music_status(
+                ctx, status_message, "🛡️ Daily traffic protection active",
+                "This upload would use the reserved traffic budget. Try again when enough older usage ages out of the rolling 24-hour window, or use a smaller file. Run `~traffic` for the current estimate.",
+                color=discord.Color.red().value,
+            )
         if not query:
             query = attachment.filename
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
                 path = temp.name
             await attachment.save(path)
+            TEMP_FILES.add(path)
+            actual_upload_bytes = Path(path).stat().st_size
+            if not _traffic_record_bytes(actual_upload_bytes, "attachment_download_bytes"):
+                clean_temp_file(path)
+                return await _set_music_status(
+                    ctx, status_message, "🛡️ Daily traffic protection active",
+                    "The daily traffic safety threshold was reached while receiving that file. The upload was discarded and music is paused until older usage ages out of the rolling window.",
+                    color=discord.Color.red().value,
+                )
             TEMP_FILES.add(path)
             track = Track(
                 title=attachment.filename,
@@ -2293,6 +2867,13 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
         error_text = str(exc)
         print(f"yt-dlp error: {error_text}", flush=True)
         lower_error = error_text.lower()
+        if _traffic_is_blocked() or "traffic safety budget" in lower_error or "per-track download allowance" in lower_error or "per-track transfer allowance" in lower_error:
+            await _set_music_status(
+                ctx, status_message, "🛡️ TRAFFIC GUARD  //  DOWNLOAD STOPPED",
+                "VaultBot stopped this transfer to protect the daily traffic budget. Music automatically pauses at the hard threshold. Run `~traffic` for the current estimate.",
+                color=discord.Color.red().value,
+            )
+            return
         if (
             ("confirm you" in lower_error and "not a bot" in lower_error)
             or "sign in to confirm" in lower_error
@@ -3786,6 +4367,8 @@ def _jw_sniff_image_ext(data: bytes) -> Optional[str]:
 
 async def _jw_download_image(session: aiohttp.ClientSession, url: str, max_bytes: int = 8_000_000):
     """Download one image. Returns (bytes, extension) or None; failures are logged, never raised."""
+    if _traffic_is_blocked():
+        return None
     try:
         async with session.get(_jw_clean_url(url), allow_redirects=True) as resp:
             if resp.status != 200:
@@ -3796,6 +4379,9 @@ async def _jw_download_image(session: aiohttp.ClientSession, url: str, max_bytes
             chunks, total = [], 0
             async for chunk in resp.content.iter_chunked(65536):
                 total += len(chunk)
+                if not _traffic_record_bytes(len(chunk), "api_response_bytes"):
+                    print("[jwcover] daily traffic safety threshold reached; image result discarded", flush=True)
+                    return None
                 if total > max_bytes:
                     print(f"[jwcover] too large (> {max_bytes} bytes): {url}", flush=True)
                     return None
@@ -3990,10 +4576,17 @@ async def _download_juicewrld_track(
         headers["X-API-Key"] = JUICEWRLD_API_KEY
 
     max_bytes = (JW_RADIO_MAX_MB if radio_fast else 200) * 1024 * 1024
+    # Even manual JW playback uses a modest per-track cap. This preserves normal
+    # songs while preventing huge lossless files from eating the day's allowance.
+    max_bytes = min(max_bytes, TRAFFIC_MAX_TRACK_DOWNLOAD_MIB * _TRAFFIC_MIB)
     last_error = None
     for endpoint, params, suffix in attempts:
         endpoint_attempts = 1 if radio_fast else 3
         for attempt in range(endpoint_attempts):
+            allowance = _traffic_download_allowance_bytes()
+            if allowance <= 0:
+                raise TrafficBudgetError("VaultBot's traffic safety budget is nearly exhausted; music downloads are paused until older usage ages out of the rolling 24-hour window.")
+            max_bytes = min(max_bytes, allowance)
             folder = Path(tempfile.mkdtemp(prefix="vaultbot_audio_"))
             local_path = folder / f"juicewrld{suffix}"
             total_bytes = 0
@@ -4025,8 +4618,13 @@ async def _download_juicewrld_track(
                                 if not chunk:
                                     continue
                                 total_bytes += len(chunk)
+                                allowed = _traffic_record_bytes(len(chunk), "audio_download_bytes")
+                                if not allowed:
+                                    raise TrafficBudgetError("VaultBot daily traffic safety budget reached; audio download aborted.")
                                 if total_bytes > max_bytes:
-                                    raise ValueError(f"The audio file exceeds VaultBot's {max_bytes // (1024 * 1024)} MB limit.")
+                                    raise TrafficBudgetError(
+                                        f"This audio file exceeded VaultBot's {max_bytes // _TRAFFIC_MIB} MiB per-track traffic allowance; it was discarded."
+                                    )
                                 output.write(chunk)
                 if total_bytes == 0:
                     raise ValueError("The API returned an empty audio file.")
@@ -4048,6 +4646,9 @@ async def _download_juicewrld_track(
                     duration=_jw_parse_duration(song),
                     source_name="Juice WRLD API",
                 )
+            except TrafficBudgetError:
+                shutil.rmtree(folder, ignore_errors=True)
+                raise
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
                 last_error = exc
                 print(
@@ -4324,6 +4925,8 @@ async def juicewrld_radio_command(ctx: commands.Context, action: str = "on"):
 
     if action not in {"on", "start", ""}:
         return await ctx.send(f"Usage: `{PREFIX}jwradio` to start or `{PREFIX}jwradio off` to disable it.")
+    if not _traffic_can_start_music():
+        return await ctx.send(embed=_traffic_protection_embed(hard=_traffic_is_blocked()))
     if guild_id in jw_radio_active:
         return await ctx.send("📻 Juice WRLD Radio is already active. Use `~jwradio off` to disable it.")
 
@@ -4426,6 +5029,8 @@ async def juicewrld_play_command(ctx: commands.Context, *, query: str = ""):
     """Search the Juice WRLD API and queue its audio in the shared music player."""
     if not ctx.guild:
         return await ctx.send("Use this command inside a server.")
+    if not _traffic_can_start_music():
+        return await ctx.send(embed=_traffic_protection_embed(hard=_traffic_is_blocked()))
     if ctx.guild.id in jw_radio_active:
         return await ctx.send(
             f"📻 **Juice WRLD Radio is active** in this server. Disable it with `~jwradio off` "
@@ -4536,6 +5141,13 @@ async def juicewrld_play_command(ctx: commands.Context, *, query: str = ""):
         await queue_track(ctx, track, status_message=status_message)
     except Exception as exc:
         print(f"[JuiceWRLD] Playback request failed: {type(exc).__name__}: {exc}")
+        if isinstance(exc, TrafficBudgetError) or _traffic_is_blocked():
+            await _set_music_status(
+                ctx, status_message, "🛡️ TRAFFIC GUARD  //  DOWNLOAD STOPPED",
+                "VaultBot stopped this transfer to protect the daily traffic budget. Music automatically pauses at the hard threshold. Run `~traffic` for the current estimate.",
+                color=discord.Color.red().value,
+            )
+            return
         await _set_music_status(
             ctx, status_message, "❌ Couldn't fetch playable audio",
             f"Details: {discord.utils.escape_markdown(str(exc))[:220]}",
@@ -4619,7 +5231,7 @@ async def ping(interaction: discord.Interaction):
 # SERVER MEMBER STAT CHANNELS
 # =============================================================================
 MEMBER_STATS_CATEGORY = "📊 SERVER STATS"
-MEMBER_STATS_REFRESH_MINUTES = 5
+MEMBER_STATS_REFRESH_MINUTES = 15
 
 
 def _member_stats_counts(guild: discord.Guild) -> tuple[int, int, int]:
@@ -5848,7 +6460,7 @@ This file is self-contained. VaultBot.py loads it inside a try/except, so if
 anything in here ever fails, the rest of the bot keeps running.
 
 Optional environment variables (all have sensible defaults):
-  PATCHNOTES_POLL_MINUTES   how often to check Steam (default 10)
+  PATCHNOTES_POLL_MINUTES   how often to check Steam (default 20, minimum 10)
   PATCHNOTES_DATA_FILE      where subscriptions are saved
                             (default: patchnotes_data.json next to this file)
   ANTHROPIC_API_KEY         optional: lets an AI model write the "key updates" summary
@@ -5889,10 +6501,10 @@ EMBED_COLOR = discord.Color.from_rgb(0, 225, 255)  # VaultBot neon-cyan sci-fi a
 
 def _poll_minutes() -> int:
     try:
-        return max(2, int(os.getenv("PATCHNOTES_POLL_MINUTES", "10")))
+        return max(10, int(os.getenv("PATCHNOTES_POLL_MINUTES", "20")))
     except (TypeError, ValueError):
-        print("[PatchNotes] PATCHNOTES_POLL_MINUTES must be a number; using 10.")
-        return 10
+        print("[PatchNotes] PATCHNOTES_POLL_MINUTES must be a number; using 20.")
+        return 20
 
 
 POLL_MINUTES = _poll_minutes()
@@ -7343,7 +7955,7 @@ Setup
 3. /drops status shows when the feed was last read and whether it's failing.
 
 Optional environment variables
-  DROPS_POLL_MINUTES   how often to read the feed (default 15, minimum 5)
+  DROPS_POLL_MINUTES   how often to read the feed (default 30, minimum 15)
   DROPS_DATA_FILE      where settings are saved (default: drops_data.json next to this file)
 
 Notes
@@ -7357,7 +7969,7 @@ Notes
 """
 
 DROPS_FEED_URL = os.getenv("DROPS_FEED_URL", "").strip()
-DROPS_POLL_MINUTES = max(5, _positive_int_env("DROPS_POLL_MINUTES", 15))
+DROPS_POLL_MINUTES = max(15, _positive_int_env("DROPS_POLL_MINUTES", 30))
 DROPS_DATA_FILE = Path(os.getenv(
     "DROPS_DATA_FILE",
     str(Path(__file__).resolve().parent / "drops_data.json"),
