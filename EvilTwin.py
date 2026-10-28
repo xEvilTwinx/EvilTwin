@@ -39,17 +39,13 @@ import signal
 import sys
 import tempfile
 import time
-import threading
 import difflib
-import sqlite3
-import shlex
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse, urlencode, urljoin, urlsplit, urlunsplit, quote
-import io
+from urllib.parse import urlparse, urlencode, urljoin
 
 import aiohttp
 import discord
@@ -75,350 +71,36 @@ PREFIX = "~"
 # Embed colours.
 BRAND_COLOR = discord.Color.from_rgb(28, 27, 32)
 JUICE_COLOR = discord.Color.from_rgb(123, 44, 191)
-MUSIC_COLOR = discord.Color.from_rgb(0, 225, 255)      # neon cyan (matches the update cards)
-MUSIC_WARN_COLOR = discord.Color.from_rgb(255, 120, 40)
-MUSIC_ERROR_COLOR = discord.Color.from_rgb(255, 35, 55)
-MUSIC_BAR = "▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱"
-MUSIC_EQ = "▁▃▅▇▅▃▁▃▅▇▅▃▁▃▅▇▅▃▁▃"
-MUSIC_AUTHOR = "VAULTBOT  //  AUDIO SYSTEM"
-MUSIC_FOOTER = "⬡ VAULTBOT AUDIO  //  LIVE PLAYER"
 
 # Music settings.
 DEFAULT_VOLUME = 0.5
-MAX_VOLUME_PERCENT = 200  # 100 = original loudness; above that the audio is amplified
-# Low-traffic mode: 32 kbps outgoing voice target (lower fidelity, less bandwidth).
-# Owners may set VAULTBOT_MUSIC_MAX_KBPS, but the safety cap stays at 48 kbps.
-try:
-    MUSIC_MAX_KBPS = min(48, max(24, int(os.getenv("VAULTBOT_MUSIC_MAX_KBPS", "32"))))
-except (TypeError, ValueError):
-    MUSIC_MAX_KBPS = 32
-VOICE_IDLE_LEAVE_SECONDS = 60
 ALLOWED_UPLOAD_SUFFIXES = {".mp3", ".wav", ".opus", ".ogg", ".m4a", ".flac"}
 MAX_UPLOAD_MB = 20
 
-# =============================================================================
-# TRAFFIC MONITOR (ADVISORY ONLY)
-# =============================================================================
-# FadeHost's full network meter is not exposed to this Python process. This
-# guard tracks known transfers and estimates voice egress where possible, but never
-# stops music based on this estimate. FadeHost's own traffic meter is authoritative.
-_TRAFFIC_MIB = 1024 * 1024
-# Monitor-only mode: the estimate never disables music or API features.
-# Warnings are advisory; FadeHost's control panel is the authoritative meter.
-TRAFFIC_WARNING_MIB = _positive_int_env("VAULTBOT_TRAFFIC_WARNING_MIB", 750)
-TRAFFIC_VOICE_OVERHEAD_FACTOR = 1.35
-TRAFFIC_CHECK_INTERVAL_SECONDS = 1
-# 5-minute buckets provide a conservative rolling 24-hour window without
-# keeping thousands of per-packet records in memory or on disk.
-_TRAFFIC_BUCKET_SECONDS = 300
-_TRAFFIC_BUCKETS_TO_KEEP = (24 * 60 * 60 // _TRAFFIC_BUCKET_SECONDS) + 1
-
-TRAFFIC_STATE_FILE = Path(os.getenv("VAULTBOT_TRAFFIC_STATE_FILE", "/data/vaultbot_traffic_state.json"))
-_TRAFFIC_FALLBACK_STATE_FILE = Path(tempfile.gettempdir()) / "vaultbot_traffic_state.json"
-_TRAFFIC_STATE_PATH = TRAFFIC_STATE_FILE
-_TRAFFIC_COUNTER_KEYS = (
-    "audio_download_bytes",
-    "attachment_download_bytes",
-    "api_response_bytes",
-    "stream_input_estimated_bytes",
-    "voice_estimated_bytes",
-    "network_interface_bytes",
-)
-_TRAFFIC_FALLBACK_COUNTER_KEYS = (
-    "audio_download_bytes",
-    "attachment_download_bytes",
-    "api_response_bytes",
-    "stream_input_estimated_bytes",
-    "voice_estimated_bytes",
-)
-_TRAFFIC_LOCK = threading.RLock()
-_TRAFFIC_LOADED = False
-_TRAFFIC_LAST_SAVE_MONO = 0.0
-_TRAFFIC_STATE = {
-    "buckets": {},
-    "audio_download_bytes": 0,
-    "attachment_download_bytes": 0,
-    "api_response_bytes": 0,
-    "stream_input_estimated_bytes": 0,
-    "voice_estimated_bytes": 0,
-    "network_interface_bytes": 0,
-    "interface_accounting_active": False,
-    "interface_baselines": {},
-    "warning_sent": False,
-}
-
-
-def _traffic_bucket_id() -> int:
-    return int(time.time() // _TRAFFIC_BUCKET_SECONDS)
-
-
-def _traffic_save_locked(force: bool = False) -> None:
-    """Persist the small rolling meter atomically; throttle writes during active playback."""
-    global _TRAFFIC_LAST_SAVE_MONO, _TRAFFIC_STATE_PATH
-    now = time.monotonic()
-    if not force and now - _TRAFFIC_LAST_SAVE_MONO < 30:
-        return
-    payload = dict(_TRAFFIC_STATE)
-    payload["buckets"] = {
-        str(key): dict(value) for key, value in _TRAFFIC_STATE.get("buckets", {}).items()
-        if isinstance(value, dict)
-    }
-    candidates = []
-    for candidate in (_TRAFFIC_STATE_PATH, TRAFFIC_STATE_FILE, _TRAFFIC_FALLBACK_STATE_FILE):
-        if candidate not in candidates:
-            candidates.append(candidate)
-    last_error = None
-    for candidate in candidates:
-        try:
-            candidate.parent.mkdir(parents=True, exist_ok=True)
-            temporary = candidate.with_suffix(candidate.suffix + ".tmp")
-            temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-            temporary.replace(candidate)
-            _TRAFFIC_STATE_PATH = candidate
-            _TRAFFIC_LAST_SAVE_MONO = now
-            return
-        except OSError as exc:
-            last_error = exc
-    # The monitor must never gate music, even when its optional state file cannot be written.
-    if not getattr(_traffic_save_locked, "warned", False):
-        print(f"[TrafficMeter] Could not persist its estimate; traffic figures may reset after a restart: {last_error}", flush=True)
-        _traffic_save_locked.warned = True
-
-
-def _traffic_refresh_totals_locked() -> int:
-    """Prune old buckets and total measured RX+TX or fallback estimates.
-
-    When Linux interface counters are available, they are the primary traffic total.
-    Category counters remain diagnostic and are not added on top of network I/O.
-    """
-    buckets = _TRAFFIC_STATE.setdefault("buckets", {})
-    current_bucket = _traffic_bucket_id()
-    oldest_bucket = current_bucket - (_TRAFFIC_BUCKETS_TO_KEEP - 1)
-    for key in list(buckets):
-        try:
-            bucket_id = int(key)
-        except (TypeError, ValueError):
-            buckets.pop(key, None)
-            continue
-        if bucket_id < oldest_bucket or not isinstance(buckets.get(key), dict):
-            buckets.pop(key, None)
-
-    totals = {counter: 0 for counter in _TRAFFIC_COUNTER_KEYS}
-    for bucket in buckets.values():
-        if not isinstance(bucket, dict):
-            continue
-        for counter in _TRAFFIC_COUNTER_KEYS:
-            try:
-                totals[counter] += max(0, int(bucket.get(counter, 0) or 0))
-            except (TypeError, ValueError, AttributeError):
-                continue
-    for counter, value in totals.items():
-        _TRAFFIC_STATE[counter] = value
-
-    if _TRAFFIC_STATE.get("interface_accounting_active"):
-        return totals["network_interface_bytes"]
-    return sum(totals[key] for key in _TRAFFIC_FALLBACK_COUNTER_KEYS)
-
-
-def _read_network_interface_counters() -> dict:
-    """Read Linux container RX/TX byte counters without requiring another package."""
-    root = Path("/sys/class/net")
-    counters = {}
+# Juice WRLD API settings.
+# Public read endpoints are used by default; no API key is required for them.
+# If your API account requires a key, set JUICEWRLD_API_KEY in the host's
+# environment settings. Never commit tokens or API keys to GitHub.
+JUICEWRLD_API_BASE = os.getenv(
+    "JUICEWRLD_API_BASE",
+    "https://juicewrldapi.com/juicewrld"
+).rstrip("/")
+JUICEWRLD_API_KEY = os.getenv("JUICEWRLD_API_KEY")
+JUICEWRLD_CHANNEL_ID = os.getenv("JUICEWRLD_CHANNEL_ID")
+def _positive_int_env(name: str, default: int) -> int:
+    """Read a positive integer environment variable without crashing startup."""
     try:
-        interfaces = list(root.iterdir())
-    except OSError:
-        return counters
-    for interface in interfaces:
-        if interface.name == "lo":
-            continue
-        try:
-            rx = int((interface / "statistics" / "rx_bytes").read_text().strip())
-            tx = int((interface / "statistics" / "tx_bytes").read_text().strip())
-            if rx >= 0 and tx >= 0:
-                counters[interface.name] = {"rx": rx, "tx": tx}
-        except (OSError, ValueError):
-            continue
-    return counters
+        return max(1, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        print(f"WARNING: {name} must be a positive integer; using {default}.")
+        return default
 
 
-def _traffic_sample_network_io() -> bool:
-    """Record container network deltas, including Discord gateway and background traffic."""
-    counters = _read_network_interface_counters()
-    if not counters:
-        return False
-
-    with _TRAFFIC_LOCK:
-        if not _TRAFFIC_STATE.get("interface_accounting_active"):
-            # Do not grant a fresh budget while switching away from legacy estimates.
-            prior_estimate = _traffic_refresh_totals_locked()
-            # Do not seed from the interface's lifetime cumulative counter: the container
-            # may have been alive for days, while the host meter resets daily. Start a new
-            # measured delta baseline now and retain the previous rolling estimate.
-            bucket_key = str(_traffic_bucket_id())
-            bucket = _TRAFFIC_STATE.setdefault("buckets", {}).setdefault(
-                bucket_key, {key: 0 for key in _TRAFFIC_COUNTER_KEYS}
-            )
-            bucket["network_interface_bytes"] = max(
-                int(bucket.get("network_interface_bytes", 0) or 0),
-                prior_estimate,
-            )
-            _TRAFFIC_STATE["interface_accounting_active"] = True
-            _TRAFFIC_STATE["interface_baselines"] = counters
-            used = _traffic_refresh_totals_locked()
-            _traffic_save_locked(force=True)
-            print(
-                f"[TrafficGuard] Linux network counters enabled; tracking {used / _TRAFFIC_MIB:.1f} MiB RX+TX.",
-                flush=True,
-            )
-            return True
-
-        previous = _TRAFFIC_STATE.get("interface_baselines", {})
-        delta = 0
-        for name, current in counters.items():
-            old = previous.get(name) if isinstance(previous, dict) else None
-            if not isinstance(old, dict):
-                # A newly appeared interface may already have transferred data.
-                delta += current["rx"] + current["tx"]
-                continue
-            for direction in ("rx", "tx"):
-                now_value = current[direction]
-                try:
-                    old_value = int(old.get(direction, 0))
-                except (TypeError, ValueError):
-                    old_value = 0
-                # If a container/interface counter resets, count its new value.
-                delta += (now_value - old_value) if now_value >= old_value else now_value
-
-        if delta > 0:
-            bucket_key = str(_traffic_bucket_id())
-            bucket = _TRAFFIC_STATE.setdefault("buckets", {}).setdefault(
-                bucket_key, {key: 0 for key in _TRAFFIC_COUNTER_KEYS}
-            )
-            bucket["network_interface_bytes"] = max(0, int(bucket.get("network_interface_bytes", 0) or 0)) + delta
-        _TRAFFIC_STATE["interface_baselines"] = counters
-        _traffic_refresh_totals_locked()
-        _traffic_save_locked()
-    return True
-
-
-def _traffic_load_state() -> None:
-    """Load persisted rolling usage once; legacy counters are migrated conservatively."""
-    global _TRAFFIC_LOADED, _TRAFFIC_STATE_PATH
-    with _TRAFFIC_LOCK:
-        if _TRAFFIC_LOADED:
-            return
-        data = None
-        for candidate in (TRAFFIC_STATE_FILE, _TRAFFIC_FALLBACK_STATE_FILE):
-            try:
-                loaded = json.loads(candidate.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    data = loaded
-                    _TRAFFIC_STATE_PATH = candidate
-                    break
-            except FileNotFoundError:
-                continue
-            except (OSError, json.JSONDecodeError, TypeError) as exc:
-                print(f"[TrafficGuard] State file could not be read ({candidate}): {exc}", flush=True)
-
-        _TRAFFIC_STATE.clear()
-        _TRAFFIC_STATE.update({
-            "buckets": {},
-            "audio_download_bytes": 0,
-            "attachment_download_bytes": 0,
-            "api_response_bytes": 0,
-            "stream_input_estimated_bytes": 0,
-            "voice_estimated_bytes": 0,
-            "network_interface_bytes": 0,
-            "interface_accounting_active": False,
-            "interface_baselines": {},
-            "warning_sent": False,
-        })
-        if isinstance(data, dict):
-            raw_buckets = data.get("buckets")
-            if isinstance(raw_buckets, dict):
-                _TRAFFIC_STATE["buckets"] = {
-                    str(key): dict(value) for key, value in raw_buckets.items()
-                    if str(key).lstrip("-").isdigit() and isinstance(value, dict)
-                }
-            else:
-                # If a prior build stored daily totals instead of buckets, treat
-                # them as new usage instead of silently granting a fresh allowance.
-                legacy_total = 0
-                legacy_values = {}
-                for key in _TRAFFIC_COUNTER_KEYS:
-                    try:
-                        legacy_values[key] = max(0, int(data.get(key, 0) or 0))
-                    except (TypeError, ValueError):
-                        legacy_values[key] = 0
-                    legacy_total += legacy_values[key]
-                if legacy_total:
-                    _TRAFFIC_STATE["buckets"][str(_traffic_bucket_id())] = legacy_values
-            _TRAFFIC_STATE["warning_sent"] = bool(data.get("warning_sent", False))
-            _TRAFFIC_STATE["interface_accounting_active"] = bool(data.get("interface_accounting_active", False))
-            saved_baselines = data.get("interface_baselines", {})
-            if isinstance(saved_baselines, dict):
-                parsed_baselines = {}
-                for name, value in saved_baselines.items():
-                    if isinstance(value, dict):
-                        try:
-                            parsed_baselines[str(name)] = {
-                                "rx": max(0, int(value.get("rx", 0))),
-                                "tx": max(0, int(value.get("tx", 0))),
-                            }
-                        except (TypeError, ValueError):
-                            continue
-                _TRAFFIC_STATE["interface_baselines"] = parsed_baselines
-        used = _traffic_refresh_totals_locked()
-        _TRAFFIC_LOADED = True
-        _traffic_save_locked(force=True)
-        print(
-            f"[TrafficMeter] Loaded {used / _TRAFFIC_MIB:.1f} MiB in the rolling 24-hour monitoring window (no music block).",
-            flush=True,
-        )
-
-
-def _traffic_ensure_current_window() -> None:
-    """Prune expired buckets and persist the advisory rolling estimate."""
-    _traffic_load_state()
-    with _TRAFFIC_LOCK:
-        used = _traffic_refresh_totals_locked()
-        warning = TRAFFIC_WARNING_MIB * _TRAFFIC_MIB
-        if used < warning:
-            _TRAFFIC_STATE["warning_sent"] = False
-        _traffic_save_locked()
-
-
-def _traffic_snapshot() -> dict:
-    _traffic_ensure_current_window()
-    with _TRAFFIC_LOCK:
-        # Refresh totals *before* copying the category fields. Copying first can
-        # show stale diagnostic totals if a rolling bucket expires at the same
-        # moment the snapshot is taken.
-        used_bytes = _traffic_refresh_totals_locked()
-        snapshot = dict(_TRAFFIC_STATE)
-        snapshot["used_bytes"] = used_bytes
-        return snapshot
-
-
-def _traffic_record_bytes(amount: int, counter: str) -> bool:
-    """Record known transfer bytes for the dashboard; never block a feature."""
-    if counter not in _TRAFFIC_COUNTER_KEYS or amount <= 0:
-        return True
-    _traffic_ensure_current_window()
-    try:
-        _traffic_sample_network_io()
-    except Exception as exc:
-        print(f"[TrafficMeter] Immediate network sample failed: {type(exc).__name__}: {exc}", flush=True)
-    with _TRAFFIC_LOCK:
-        bucket_key = str(_traffic_bucket_id())
-        buckets = _TRAFFIC_STATE.setdefault("buckets", {})
-        bucket = buckets.setdefault(bucket_key, {key: 0 for key in _TRAFFIC_COUNTER_KEYS})
-        bucket[counter] = max(0, int(bucket.get(counter, 0) or 0)) + int(amount)
-        _traffic_refresh_totals_locked()
-        _traffic_save_locked()
-    return True
-
-
+JUICEWRLD_POLL_MINUTES = _positive_int_env("JUICEWRLD_POLL_MINUTES", 5)
+JUICEWRLD_STATE_FILE = Path(os.getenv(
+    "JUICEWRLD_STATE_FILE",
+    str(Path(tempfile.gettempdir()) / "juicewrld_seen.json")
+))
 
 
 # =============================================================================
@@ -440,27 +122,6 @@ intents.members = True
 # multi-page help in section 9 can take over the ~help command.
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
-# Lightweight member join/leave history used by ~profile. The path follows the
-# legacy XP DB environment variable so existing profile history remains available.
-PROFILE_DB_PATH = Path(os.getenv(
-    "VAULTBOT_PROFILE_DB",
-    os.getenv("VAULTBOT_XP_DB", "/data/vaultbot_xp.sqlite3"),
-))
-
-def _profile_connect():
-    PROFILE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(PROFILE_DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS profile_presence (
-            guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, joins INTEGER NOT NULL DEFAULT 0,
-            leaves INTEGER NOT NULL DEFAULT 0, first_recorded_join TEXT, last_joined TEXT,
-            PRIMARY KEY (guild_id, user_id)
-        )"""
-    )
-    return conn
-
-
 
 # =============================================================================
 # 4. YT-DLP SOURCE CONFIGURATION (COOKIE-FREE)
@@ -469,7 +130,7 @@ def _profile_connect():
 # bypass paid services, DRM, private content, or service licensing restrictions.
 YTDL_OPTIONS = {
     # Prefer an audio-only format; avoid fetching video when audio is available.
-    "format": "bestaudio[abr<=48][acodec!=none]/bestaudio[abr<=64][acodec!=none]/bestaudio[abr<=80][acodec!=none]/bestaudio[abr<=96][acodec!=none]/bestaudio[acodec!=none]/bestaudio",
+    "format": "bestaudio[acodec!=none]/bestaudio/best[acodec!=none]/best",
     "noplaylist": True,
     "playlist_items": "1",
     "quiet": True,
@@ -481,8 +142,8 @@ YTDL_OPTIONS = {
     # Keep yt-dlp's disk cache off and prevent concurrent fragment buffering.
     "cachedir": False,
     "concurrent_fragment_downloads": 1,
-    "retries": 1,
-    "fragment_retries": 1,
+    "retries": 2,
+    "fragment_retries": 2,
     "socket_timeout": 12,
 }
 
@@ -493,13 +154,7 @@ _yt_clients = [c.strip() for c in os.getenv("YT_PLAYER_CLIENTS", "").split(",") 
 if _yt_clients:
     YTDL_OPTIONS["extractor_args"] = {"youtube": {"player_client": _yt_clients}}
 
-# Normalize audio timing and send a short silent pre-roll before the first audible
-# samples. This gives the Discord voice connection/Opus encoder a moment to settle,
-# which can help prevent the first instant of a track sounding rushed or garbled.
-# Audio is still decoded to discord.py's standard 48 kHz stereo PCM format.
-FFMPEG_OPTIONS = {
-    "options": "-vn -threads 1 -af aresample=48000:async=1:first_pts=0,adelay=300|300"
-}
+FFMPEG_OPTIONS = {"options": "-vn -threads 1"}
 
 
 # This build intentionally does not read or create YouTube cookie files.
@@ -603,7 +258,6 @@ class Track:
     local_path: Optional[str] = None
     duration: Optional[int] = None
     source_name: str = "audio"
-    stream_headers: Optional[str] = None
 
 
 def get_queue(guild_id: int) -> deque:
@@ -637,86 +291,18 @@ def clean_temp_file(path: Optional[str]) -> None:
     TEMP_FILES.discard(path)
 
 
-_MUSIC_GLYPHS = (
-    ("✅", "◈"), ("🎶", "◈"), ("🎵", "◈"), ("🔎", "◎"), ("⚠️", "▲"), ("⚠", "▲"),
-    ("❌", "✕"), ("📻", "◉"), ("➕", "▣"),
-)
-
-
-def _music_glyph_title(title: str) -> str:
-    """Swap a leading emoji for a clean geometric glyph, matching the update-card style."""
-    text = (title or "").strip()
-    for emoji, glyph in _MUSIC_GLYPHS:
-        if text.startswith(emoji):
-            return f"{glyph}  {text[len(emoji):].strip()}"[:256]
-    return text[:256]
-
-
-def _music_status_embed(title: str, description: str, color=None) -> discord.Embed:
-    """Futuristic status card used by every music/radio acknowledgement."""
-    embed = discord.Embed(
-        title=_music_glyph_title(title),
-        description=(description or "")[:4000],
-        color=color if color is not None else MUSIC_COLOR,
-    )
-    embed.set_author(name=MUSIC_AUTHOR)
-    embed.set_footer(text=MUSIC_FOOTER)
-    return embed
-
-
-def _music_source_label(track: Track) -> str:
-    return str(track.source_name or "audio").split(":")[0].upper()[:24]
-
-
 def build_now_playing_embed(track: Track, loop_mode: Optional[str] = None) -> discord.Embed:
     """Embed shown by the 'Now Playing' announcement and ~nowplaying."""
-    source = _music_source_label(track)
-    chips = f"`◈ NOW PLAYING`  `⬡ {source}`"
-    url = track.webpage_url if str(track.webpage_url or "").startswith(("https://", "http://")) else None
     embed = discord.Embed(
-        title=f"◈  {track.title}"[:256],
-        url=url,
-        description=f"{chips}\n{MUSIC_EQ}",
-        color=MUSIC_COLOR,
+        title="🎶 Now Playing",
+        description=f"[{discord.utils.escape_markdown(track.title)}]({track.webpage_url})",
+        color=BRAND_COLOR,
     )
-    embed.set_author(name=MUSIC_AUTHOR)
-    embed.add_field(name="◷  DURATION", value=f"`{format_duration(track.duration)}`", inline=True)
-    embed.add_field(name="⌘  REQUESTED BY", value=str(track.requester)[:100], inline=True)
+    embed.add_field(name="Duration", value=format_duration(track.duration), inline=True)
+    embed.add_field(name="Requested by", value=track.requester, inline=True)
     if loop_mode is not None:
-        embed.add_field(name="▣  LOOP", value=f"`{str(loop_mode).upper()}`", inline=True)
-    embed.set_footer(text=MUSIC_FOOTER)
+        embed.set_footer(text=f"Loop: {loop_mode}")
     return embed
-
-
-async def _set_music_status(
-    ctx: commands.Context,
-    message: Optional[discord.Message],
-    title: str,
-    description: str,
-    *,
-    color: int = None,
-) -> None:
-    """Edit the instant music-command acknowledgement instead of leaving users waiting."""
-    # Keep the semantic colours for problems, use the neon accent for everything else.
-    if isinstance(color, discord.Color):
-        color = color.value
-    if color is None or color == discord.Color.green().value or color == BRAND_COLOR.value:
-        color = MUSIC_COLOR
-    elif color == discord.Color.orange().value:
-        color = MUSIC_WARN_COLOR
-    elif color == discord.Color.red().value:
-        color = MUSIC_ERROR_COLOR
-    embed = _music_status_embed(title, description, color)
-    if message is not None:
-        try:
-            await message.edit(embed=embed)
-            return
-        except (discord.HTTPException, discord.NotFound):
-            pass
-    try:
-        await ctx.send(embed=embed)
-    except discord.HTTPException:
-        pass
 
 
 # =============================================================================
@@ -816,16 +402,9 @@ async def _fallback_search_variants(query: str) -> list:
     return out
 
 
-async def extract_track(query: str, requester: str, on_found=None) -> Track:
-    """Find and download one playable audio track with one yt-dlp extraction pass.
-
-    When provided, on_found(title) is called as soon as yt-dlp resolves a result
-    and begins downloading it, so the Discord status embed can update before the
-    full audio file finishes downloading.
-    """
-    loop = asyncio.get_running_loop()
-
-    def _extract(query: str, notify_found=None):
+async def extract_track(query: str, requester: str) -> Track:
+    """Find and download one playable audio track with one yt-dlp extraction pass."""
+    def _extract(query: str):
         folder = tempfile.mkdtemp(prefix="vaultbot_audio_")
         options = dict(YTDL_OPTIONS)
         options.update({
@@ -835,38 +414,6 @@ async def extract_track(query: str, requester: str, on_found=None) -> Track:
             "playlist_items": "1",
             "skip_download": False,
         })
-        found_notified = False
-        accounted_downloaded_bytes = 0
-
-        def progress_hook(progress):
-            nonlocal found_notified, accounted_downloaded_bytes
-            status = progress.get("status")
-            if status in {"downloading", "finished"}:
-                try:
-                    downloaded = max(0, int(progress.get("downloaded_bytes") or 0))
-                except (TypeError, ValueError):
-                    downloaded = 0
-                if downloaded > accounted_downloaded_bytes:
-                    delta = downloaded - accounted_downloaded_bytes
-                    accounted_downloaded_bytes = downloaded
-                    _traffic_record_bytes(delta, "audio_download_bytes")
-            if found_notified or status != "downloading" or notify_found is None:
-                return
-            info = progress.get("info_dict") or {}
-            title = str(info.get("title") or "").strip()
-            if not title:
-                return
-            found_notified = True
-            try:
-                # Wait for the embed edit to finish before continuing download,
-                # preventing a late 'Found' update from overwriting the queued state.
-                future = asyncio.run_coroutine_threadsafe(notify_found(title), loop)
-                future.result(timeout=10)
-            except Exception as hook_exc:
-                print(f"[music status] Could not update found-song embed: {hook_exc}", flush=True)
-
-        # Count downloads even when there is no early-status callback.
-        options["progress_hooks"] = list(options.get("progress_hooks") or []) + [progress_hook]
 
         try:
             diag("yt-dlp: starting one-pass search/extraction/download")
@@ -912,15 +459,6 @@ async def extract_track(query: str, requester: str, on_found=None) -> Track:
                     raise ValueError("yt-dlp did not produce an audio file.")
                 path = str(candidates[0])
 
-            # Some extractors don't emit byte progress. Count the final file size
-            # only when the hook did not already account for those bytes.
-            try:
-                final_size = Path(path).stat().st_size
-            except OSError:
-                final_size = 0
-            if final_size > accounted_downloaded_bytes:
-                _traffic_record_bytes(final_size - accounted_downloaded_bytes, "audio_download_bytes")
-                accounted_downloaded_bytes = final_size
             diag("yt-dlp: download finished")
             return {
                 "title": info.get("title") or "Unknown title",
@@ -935,7 +473,7 @@ async def extract_track(query: str, requester: str, on_found=None) -> Track:
 
     async with _YTDL_SEMAPHORE:
         try:
-            data = await asyncio.to_thread(_extract, query, on_found)
+            data = await asyncio.to_thread(_extract, query)
         except Exception as exc:
             if not _is_signin_error(str(exc)):
                 raise
@@ -952,7 +490,7 @@ async def extract_track(query: str, requester: str, on_found=None) -> Track:
                 if not sc_url:
                     continue
                 try:
-                    data = await asyncio.to_thread(_extract, sc_url, on_found)
+                    data = await asyncio.to_thread(_extract, sc_url)
                     break
                 except Exception as sc_exc:
                     print(f"[fallback] SoundCloud download failed: {sc_exc}", flush=True)
@@ -989,6 +527,7 @@ async def play_next(ctx: commands.Context) -> None:
         if not voice or not voice.is_connected():
             current_tracks.pop(guild_id, None)
             return
+
         previous = current_tracks.get(guild_id)
         mode = loop_modes.get(guild_id, "off")
         if previous and mode == "song":
@@ -1007,17 +546,10 @@ async def play_next(ctx: commands.Context) -> None:
         volume = volumes.get(guild_id, DEFAULT_VOLUME)
 
         try:
-            if track.stream_url:
-                before_options = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 3 -rw_timeout 15000000"
-                if track.stream_headers:
-                    before_options += f" -headers {shlex.quote(track.stream_headers)}"
-                audio = discord.FFmpegPCMAudio(
-                    track.stream_url, before_options=before_options, **FFMPEG_OPTIONS
-                )
-            else:
-                if not track.local_path or not Path(track.local_path).is_file():
-                    raise ValueError("The local audio file is missing. Try the song again.")
-                audio = discord.FFmpegPCMAudio(track.local_path, **FFMPEG_OPTIONS)
+            if not track.local_path or not Path(track.local_path).is_file():
+                raise ValueError("The downloaded audio file is missing. Try the song again.")
+            # Both YouTube downloads and Discord attachments play from local files.
+            audio = discord.FFmpegPCMAudio(track.local_path, **FFMPEG_OPTIONS)
 
             source = discord.PCMVolumeTransformer(audio, volume=volume)
 
@@ -1032,11 +564,7 @@ async def play_next(ctx: commands.Context) -> None:
                 except RuntimeError as exc:
                     print(f"Could not schedule next track: {exc}")
 
-            try:
-                voice.play(source, after=after_playback, **_opus_play_kwargs(voice))
-            except TypeError:
-                # Older discord.py without Opus encoder options: play with the defaults.
-                voice.play(source, after=after_playback)
+            voice.play(source, after=after_playback)
             # Keep the voice player's audio source alive and announce the track.
             await update_now_playing(ctx, track)
         except Exception as error:
@@ -1048,22 +576,6 @@ async def play_next(ctx: commands.Context) -> None:
             current_tracks.pop(guild_id, None)
             # Try the next queued track.
             bot.loop.call_soon(lambda: asyncio.create_task(play_next(ctx)))
-
-
-def _opus_play_kwargs(voice) -> dict:
-    """Better Opus encoding for music.
-
-    discord.py's defaults are 128 kbps, signal_type 'auto' and 15% expected packet loss
-    (which makes the encoder spend bits on error protection instead of sound quality).
-    Use the voice channel's own bitrate as the target (capped at MUSIC_MAX_KBPS to limit data use), tell the
-    encoder the signal is music, and assume only a little packet loss.
-    """
-    kbps = 128
-    try:
-        kbps = int((getattr(voice.channel, "bitrate", 128000) or 128000) // 1000)
-    except (TypeError, ValueError, AttributeError):
-        pass
-    return {"bitrate": max(24, min(kbps, MUSIC_MAX_KBPS)), "signal_type": "music", "expected_packet_loss": 0.05}
 
 
 async def ensure_voice(ctx: commands.Context) -> discord.VoiceClient:
@@ -1079,197 +591,285 @@ async def ensure_voice(ctx: commands.Context) -> discord.VoiceClient:
     return await ctx.author.voice.channel.connect()
 
 
-async def queue_track(
-    ctx: commands.Context,
-    track: Track,
-    *,
-    status_message: Optional[discord.Message] = None,
-) -> None:
+async def queue_track(ctx: commands.Context, track: Track) -> None:
     guild_id = ctx.guild.id
     get_queue(guild_id).append(track)
-    queue_position = len(get_queue(guild_id))
-    if status_message is not None:
-        await _set_music_status(
-            ctx,
-            status_message,
-            "✅ TRACK QUEUED",
-            f"`◈ QUEUED`  `◷ {format_duration(track.duration)}`  `▣ POSITION {queue_position}`\n"
-            f"{MUSIC_BAR}\n\n"
-            f"**{discord.utils.escape_markdown(track.title)}**",
-            color=MUSIC_COLOR.value,
-        )
-    else:
-        await ctx.send(embed=_music_status_embed(
-            "➕ TRACK QUEUED",
-            f"`◈ QUEUED`  `◷ {format_duration(track.duration)}`  `▣ POSITION {queue_position}`\n"
-            f"{MUSIC_BAR}\n\n"
-            f"**{discord.utils.escape_markdown(track.title)}**",
-        ))
+    await ctx.send(
+        f"➕ Added **{discord.utils.escape_markdown(track.title)}** "
+        f"(`{format_duration(track.duration)}`) to the queue. Position: "
+        f"{len(get_queue(guild_id))}"
+    )
     voice = ctx.guild.voice_client
     if voice and not voice.is_playing() and not voice.is_paused():
         await play_next(ctx)
 
 
+# =============================================================================
+# 8. JUICE WRLD INTEGRATION
+# =============================================================================
+_juicewrld_seen: set[str] = set()
+_juicewrld_state_loaded = False
+_juicewrld_baseline_initialized = False
 
 
-# ---- Estimate traffic and voice egress (monitor only) ----
-_TRAFFIC_LAST_VOICE_TICK = 0.0
+def _load_juicewrld_state() -> None:
+    """Load persisted event IDs once, so restarts do not repost old events."""
+    global _juicewrld_state_loaded, _juicewrld_baseline_initialized
+    if _juicewrld_state_loaded:
+        return
+    _juicewrld_state_loaded = True
+    try:
+        data = json.loads(JUICEWRLD_STATE_FILE.read_text(encoding="utf-8"))
+        saved_ids = data.get("seen", [])
+        if isinstance(saved_ids, list):
+            _juicewrld_seen.update(str(value) for value in saved_ids)
+            _juicewrld_baseline_initialized = True
+        print(f"[JuiceWRLD] Loaded {len(_juicewrld_seen)} saved tracker event(s).")
+    except FileNotFoundError:
+        # First run records a baseline and skips historical events.
+        _juicewrld_baseline_initialized = False
+    except (OSError, json.JSONDecodeError, AttributeError) as exc:
+        print(f"[JuiceWRLD] Could not load state file: {exc}")
+        _juicewrld_baseline_initialized = False
 
 
-async def _traffic_send_notice(guild_id: int, embed: discord.Embed) -> None:
-    message = now_playing_messages.get(guild_id)
-    channel = getattr(message, "channel", None) if message is not None else None
-    if channel is not None:
-        try:
-            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-        except (discord.HTTPException, discord.Forbidden, AttributeError):
-            pass
-
-
-async def _traffic_send_warning() -> None:
-    snapshot = _traffic_snapshot()
-    used_mib = snapshot["used_bytes"] / _TRAFFIC_MIB
-    embed = discord.Embed(
-        title="⚠️ VAULTBOT // TRAFFIC WARNING",
-        description=(
-            f"Tracked rolling-24-hour usage is **{used_mib:.1f} MiB**.\n"
-            "This is an advisory estimate only; VaultBot will not automatically block or stop music.\n"
-            "Use FadeHost's meter for authoritative usage and `~traffic` for the bot's estimate."
-        ),
-        color=MUSIC_WARN_COLOR,
+def _save_juicewrld_state() -> None:
+    """Write tracker state atomically to reduce corruption on a restart."""
+    JUICEWRLD_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = JUICEWRLD_STATE_FILE.with_suffix(JUICEWRLD_STATE_FILE.suffix + ".tmp")
+    temporary_path.write_text(
+        json.dumps({"seen": sorted(_juicewrld_seen)}, ensure_ascii=False),
+        encoding="utf-8",
     )
-    for guild in list(bot.guilds):
-        if guild.voice_client is None and not get_queue(guild.id) and guild.id not in current_tracks:
-            continue
-        await _traffic_send_notice(guild.id, embed)
+    temporary_path.replace(JUICEWRLD_STATE_FILE)
 
 
-@tasks.loop(seconds=TRAFFIC_CHECK_INTERVAL_SECONDS)
-async def traffic_guard_task():
-    """Estimate traffic and send advisory warnings; this task never stops music."""
-    global _TRAFFIC_LAST_VOICE_TICK
-    now = time.monotonic()
-    if _TRAFFIC_LAST_VOICE_TICK <= 0:
-        _TRAFFIC_LAST_VOICE_TICK = now
-    elapsed = min(TRAFFIC_CHECK_INTERVAL_SECONDS * 2, max(0.0, now - _TRAFFIC_LAST_VOICE_TICK))
-    _TRAFFIC_LAST_VOICE_TICK = now
+async def _juicewrld_api_get(path: str, params: Optional[dict] = None):
+    timeout = aiohttp.ClientTimeout(total=20)
+    headers = {"Accept": "application/json"}
+    if JUICEWRLD_API_KEY:
+        headers["X-API-Key"] = JUICEWRLD_API_KEY
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.get(
+            f"{JUICEWRLD_API_BASE}/{path.lstrip('/')}", params=params
+        ) as response:
+            response.raise_for_status()
+            return await response.json(content_type=None)
 
-    # Prefer container RX+TX counters, which also include Discord gateway, feed and API
-    # traffic. The voice estimate is only used if this host doesn't expose NIC counters.
-    network_sample_available = _traffic_sample_network_io()
-    with _TRAFFIC_LOCK:
-        has_interface_meter = bool(_TRAFFIC_STATE.get("interface_accounting_active")) and network_sample_available
 
-    voice_bytes = 0
-    stream_input_bytes = 0
-    if not has_interface_meter and elapsed > 0:
-        for guild in list(bot.guilds):
-            voice = guild.voice_client
-            if voice is None or not voice.is_connected() or not voice.is_playing():
+def _juicewrld_items(payload):
+    """Support common paginated and list-shaped API responses."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("results", "items", "data", "events", "files", "entries", "children"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+def _juicewrld_safe(value, fallback="Unknown", limit=250):
+    if value is None:
+        return fallback
+    text = str(value).strip()
+    if not text:
+        return fallback
+    return text.replace("@", "@\u200b")[:limit]
+
+
+def _juicewrld_embed_timestamp(embed: discord.Embed, item: dict) -> None:
+    timestamp = item.get("timestamp") or item.get("created_at") or item.get("created")
+    if not timestamp:
+        return
+    try:
+        embed.timestamp = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        pass
+
+
+def _juicewrld_safe_link(value) -> Optional[str]:
+    """Only allow links hosted by JuiceWRLD API domains."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = urlparse(value.strip())
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme == "https" and (
+            host == "juicewrldapi.com" or host.endswith(".juicewrldapi.com")
+        ):
+            return value.strip()
+    except ValueError:
+        pass
+    return None
+
+
+def _juicewrld_event_song_id(item: dict):
+    for key in ("song_id", "catalog_id", "track_id", "song"):
+        value = item.get(key)
+        if isinstance(value, dict):
+            value = value.get("id")
+        if value is not None and str(value).isdigit():
+            return int(value)
+    return None
+
+
+async def _juicewrld_song_detail_for_event(item: dict) -> Optional[dict]:
+    song_id = _juicewrld_event_song_id(item)
+    if song_id is None:
+        return None
+    try:
+        payload = await _juicewrld_api_get(f"/songs/{song_id}/")
+        return payload if isinstance(payload, dict) else None
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+        print(f"[JuiceWRLD] Could not load details for new catalog entry {song_id}: {exc!r}")
+        return None
+
+
+def _juicewrld_add_event_metadata(embed: discord.Embed, item: dict) -> None:
+    """Add concise event metadata while respecting Discord embed limits."""
+    field_map = (
+        ("Category", ("category", "type")),
+        ("Added by", ("user", "added_by", "created_by")),
+        ("Producers", ("producers",)),
+        ("Engineers", ("engineers",)),
+        ("Leak info", ("date_leaked", "leak_type")),
+        ("Alternate titles", ("track_titles", "alternate_titles")),
+    )
+    for label, keys in field_map:
+        values = []
+        for key in keys:
+            value = item.get(key)
+            if value is None or value == "":
                 continue
-            kbps = MUSIC_MAX_KBPS
-            try:
-                channel_bitrate = int(getattr(voice.channel, "bitrate", 128000) or 128000) // 1000
-                kbps = max(24, min(channel_bitrate, MUSIC_MAX_KBPS))
-            except (TypeError, ValueError, AttributeError):
-                pass
-            voice_bytes += int(elapsed * kbps * 1000 / 8 * TRAFFIC_VOICE_OVERHEAD_FACTOR)
-            active_track = current_tracks.get(guild.id)
-            if active_track is not None and active_track.stream_url:
-                try:
-                    match = re.match(r"\s*(\d+(?:\.\d+)?)\s*k", JW_PLAYBACK_BITRATE, re.IGNORECASE)
-                    input_kbps = float(match.group(1)) if match else 64.0
-                except (TypeError, ValueError):
-                    input_kbps = 64.0
-                # Estimate source-side compressed bytes separately from Discord voice output.
-                stream_input_bytes += int(elapsed * input_kbps * 1000 / 8 * 1.10)
-    if stream_input_bytes:
-        _traffic_record_bytes(stream_input_bytes, "stream_input_estimated_bytes")
-    if voice_bytes:
-        _traffic_record_bytes(voice_bytes, "voice_estimated_bytes")
+            if isinstance(value, list):
+                value = ", ".join(str(part) for part in value if part is not None)
+            elif isinstance(value, dict):
+                value = ", ".join(f"{k}: {v}" for k, v in value.items() if v is not None)
+            value = _juicewrld_safe(value, "", 900)
+            if value:
+                values.append(value)
+        if values and len(embed.fields) < 24:
+            embed.add_field(name=label, value="\n".join(values)[:1000], inline=False)
 
-    snapshot = _traffic_snapshot()
-    used_bytes = snapshot["used_bytes"]
-    warning_bytes = TRAFFIC_WARNING_MIB * _TRAFFIC_MIB
-    if used_bytes >= warning_bytes and not snapshot.get("warning_sent"):
-        with _TRAFFIC_LOCK:
-            if not _TRAFFIC_STATE.get("warning_sent"):
-                _TRAFFIC_STATE["warning_sent"] = True
-                _traffic_save_locked(force=True)
-                should_warn = True
+
+@tasks.loop(minutes=JUICEWRLD_POLL_MINUTES)
+async def juicewrld_tracker_task():
+    """Poll the tracker feed and post polished updates plus distinct new-song alerts."""
+    global _juicewrld_baseline_initialized
+    if not JUICEWRLD_CHANNEL_ID:
+        return
+
+    try:
+        channel_id = int(JUICEWRLD_CHANNEL_ID)
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            channel = await bot.fetch_channel(channel_id)
+        if not hasattr(channel, "send"):
+            print("[JuiceWRLD] Configured channel cannot receive messages.")
+            return
+
+        payload = await _juicewrld_api_get("/feeds/tracker.json", params={"limit": 50})
+        updates = _juicewrld_items(payload)
+
+        if not _juicewrld_baseline_initialized:
+            for item in updates:
+                if isinstance(item, dict):
+                    event_id = item.get("id", item.get("proposal_id"))
+                    if event_id is not None:
+                        _juicewrld_seen.add(str(event_id))
+            _save_juicewrld_state()
+            _juicewrld_baseline_initialized = True
+            print(
+                f"[JuiceWRLD] Baseline initialized with {len(_juicewrld_seen)} existing event(s); "
+                "old events skipped."
+            )
+            return
+
+        fresh = []
+        for item in updates:
+            if not isinstance(item, dict):
+                continue
+            event_id = item.get("id", item.get("proposal_id"))
+            if event_id is not None and str(event_id) not in _juicewrld_seen:
+                fresh.append((str(event_id), item))
+
+        # Tracker feeds are usually newest-first; publish oldest unseen event first.
+        for event_id, item in reversed(fresh):
+            title = _juicewrld_safe(item.get("name") or item.get("title"), "Untitled song", 200)
+            action_raw = str(item.get("action") or "update").strip().lower()
+            is_new_song = action_raw in {"create", "created", "new", "add", "added"}
+            editor = _juicewrld_safe(item.get("user") or item.get("added_by"), "Unknown", 100)
+            link = _juicewrld_safe_link(item.get("link") or item.get("url"))
+
+            if is_new_song:
+                embed = discord.Embed(
+                    title=f"✦ JUICE WRLD // NEW CATALOG ENTRY",
+                    description=f"## ◈ {title}\n**NEW SONG ADDED** · Catalog database event",
+                    color=discord.Color.from_rgb(0, 220, 210),
+                    url=link,
+                )
+                detail = await _juicewrld_song_detail_for_event(item)
+                combined = dict(item)
+                if detail:
+                    combined.update(detail)
+                    title = _juicewrld_safe(detail.get("name") or detail.get("title") or title, title, 200)
+                    embed.description = f"## ◈ {title}\n**NEW SONG ADDED** · Fresh catalog entry"
+                    image_url = detail.get("image_url") or detail.get("artwork_url")
+                    if isinstance(image_url, str) and image_url.strip():
+                        if image_url.startswith("/"):
+                            image_url = "https://juicewrldapi.com" + image_url
+                        if image_url.startswith("https://") or image_url.startswith("http://"):
+                            embed.set_thumbnail(url=image_url)
+                _juicewrld_add_event_metadata(embed, combined)
+                catalog_id = combined.get("public_id") or combined.get("song_id") or combined.get("id")
+                if catalog_id is not None and len(embed.fields) < 25:
+                    embed.add_field(name="Catalog ID", value=_juicewrld_safe(catalog_id, "Unknown", 100), inline=True)
+                embed.set_footer(text="JUICEWRLDAPI.COM • New catalog entry detected")
+                print(f"[JuiceWRLD] New-song event detected: {title}")
             else:
-                should_warn = False
-        if should_warn:
-            print(f"[TrafficMeter] Advisory warning threshold reached at {used_bytes / _TRAFFIC_MIB:.1f} MiB.", flush=True)
-            await _traffic_send_warning()
+                embed = discord.Embed(
+                    title=f"◈ JUICE WRLD // TRACKER UPDATE",
+                    description=f"**{title}**\n`UPDATE`  ·  {action_raw.upper()}",
+                    color=JUICE_COLOR,
+                    url=link,
+                )
+                embed.add_field(name="◈ ACTION", value=_juicewrld_safe(item.get("action"), "Update", 100), inline=True)
+                embed.add_field(name="◈ EDITED BY", value=editor, inline=True)
+                song_id = _juicewrld_event_song_id(item)
+                if song_id is not None:
+                    embed.add_field(name="◈ SONG ID", value=str(song_id), inline=True)
+                changed_fields = item.get("fields") or item.get("changed_fields")
+                if isinstance(changed_fields, list) and changed_fields:
+                    embed.add_field(
+                        name="◇ FIELDS CHANGED",
+                        value=", ".join(_juicewrld_safe(field, limit=100) for field in changed_fields)[:1000],
+                        inline=False,
+                    )
+                notes = item.get("notes")
+                if notes:
+                    embed.add_field(name="◇ NOTES", value=_juicewrld_safe(notes, limit=1000), inline=False)
+                embed.set_footer(text="juicewrldapi.com • Tracker event, not necessarily a new release")
+
+            _juicewrld_embed_timestamp(embed, item)
+            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+            _juicewrld_seen.add(event_id)
+            _save_juicewrld_state()
+            print(f"[JuiceWRLD] Posted tracker event {event_id}: {title}")
+
+    except asyncio.CancelledError:
+        raise
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        print(f"[JuiceWRLD] API request failed: {exc!r}")
+    except (ValueError, discord.HTTPException, OSError, TypeError) as exc:
+        print(f"[JuiceWRLD] Tracker task failed: {exc!r}")
+    except Exception as exc:  # keep the tracker alive: an unexpected error must not stop future polls
+        print(f"[JuiceWRLD] Unexpected tracker error: {type(exc).__name__}: {exc!r}")
 
 
-@traffic_guard_task.before_loop
-async def before_traffic_guard_task():
+@juicewrld_tracker_task.before_loop
+async def _before_juicewrld_tracker_task():
     await bot.wait_until_ready()
-    _traffic_load_state()
-
-
-@bot.command(name="traffic", aliases=["bandwidth"])
-async def traffic_status_command(ctx: commands.Context):
-    """Show the best-effort rolling traffic estimate; never blocks music."""
-    snapshot = _traffic_snapshot()
-    used_mib = snapshot["used_bytes"] / _TRAFFIC_MIB
-    download_mib = snapshot["audio_download_bytes"] / _TRAFFIC_MIB
-    attachment_mib = snapshot["attachment_download_bytes"] / _TRAFFIC_MIB
-    api_mib = snapshot["api_response_bytes"] / _TRAFFIC_MIB
-    stream_input_mib = snapshot["stream_input_estimated_bytes"] / _TRAFFIC_MIB
-    voice_mib = snapshot["voice_estimated_bytes"] / _TRAFFIC_MIB
-    warning_hit = used_mib >= TRAFFIC_WARNING_MIB
-    embed = discord.Embed(
-        title="⬡ VAULTBOT // TRAFFIC MONITOR",
-        description=(
-            f"**{used_mib:.1f} MiB tracked estimate**\n"
-            f"{'⚠️ Advisory warning threshold reached.' if warning_hit else '🟢 Monitoring only; music is not automatically blocked.'}\n"
-            "Window: **rolling 24 hours**\n"
-            + ("Counter: **container network RX + TX** (includes all container networking)." if snapshot.get("interface_accounting_active") else "Counter: **tracked estimates only**; Linux network counters unavailable.")
-        ),
-        color=MUSIC_WARN_COLOR if warning_hit else MUSIC_COLOR,
-    )
-    if snapshot.get("interface_accounting_active"):
-        interface_mib = snapshot.get("network_interface_bytes", 0) / _TRAFFIC_MIB
-        breakdown_value = (
-            f"🌐 Container network RX + TX: **{interface_mib:.1f} MiB**\n"
-            f"🎧 Voice egress estimate (diagnostic): **{voice_mib:.1f} MiB**\n"
-            f"⬇️ Audio downloads (diagnostic): **{download_mib:.1f} MiB**\n"
-            f"📎 Attachments (diagnostic): **{attachment_mib:.1f} MiB**\n"
-            f"API response bodies (diagnostic): **{api_mib:.1f} MiB**\n"
-            f"📥 Compressed stream input estimate (diagnostic): **{stream_input_mib:.1f} MiB**\n"
-            "*Diagnostic categories overlap with RX + TX and are not added again.*"
-        )
-    else:
-        diagnostic_sum_mib = download_mib + attachment_mib + api_mib + stream_input_mib + voice_mib
-        mismatch_tolerance_mib = max(10.0, used_mib * 0.25)
-        if diagnostic_sum_mib > used_mib + mismatch_tolerance_mib:
-            breakdown_value = (
-                "⚠️ **Diagnostic counters disagree**\n"
-                f"Categories sum to **{diagnostic_sum_mib:.1f} MiB**, but the tracked total is **{used_mib:.1f} MiB**.\n"
-                "Treat category values as estimates only; FadeHost's usage meter is authoritative."
-            )
-        else:
-            breakdown_value = (
-                f"🎧 Voice egress estimate: **{voice_mib:.1f} MiB**\n"
-                f"⬇️ Audio files downloaded: **{download_mib:.1f} MiB**\n"
-                f"📎 Discord audio uploads received: **{attachment_mib:.1f} MiB**\n"
-                f"🌐 API response bodies: **{api_mib:.1f} MiB**\n"
-                f"📥 Compressed stream input estimate: **{stream_input_mib:.1f} MiB**"
-            )
-    embed.add_field(name="Traffic breakdown (estimates)", value=breakdown_value, inline=False)
-    embed.add_field(
-        name="Current behavior",
-        value=(
-            f"Advisory warning threshold: **{TRAFFIC_WARNING_MIB} MiB**\n"
-            "Daily traffic blocking: **disabled**"
-        ),
-        inline=False,
-    )
-    embed.set_footer(text="Estimate only. FadeHost's own daily traffic meter is authoritative.")
-    await ctx.send(embed=embed)
 
 
 # =============================================================================
@@ -1294,8 +894,9 @@ HELP_PAGES: list[dict] = [
         "summary": "What VaultBot does and where to find everything",
         "color": BRAND_COLOR,
         "description": (
-            "VaultBot plays music in your voice channels and provides staff tools "
-            "for posting releases and announcements.\n\n"
+            "VaultBot plays music in your voice channels, looks up Juice WRLD "
+            "catalog info, and gives staff tools for posting releases and "
+            "announcements.\n\n"
             f"**Prefix commands** start with `{PREFIX}` and **slash commands** "
             "start with `/`.\n"
             "Use the ◀ ▶ buttons or the dropdown below to browse every feature."
@@ -1307,17 +908,18 @@ HELP_PAGES: list[dict] = [
                 "Comes with a queue, loop modes, volume control, and more.",
             ),
             (
+                "🧃 Juice WRLD Tools — page 4",
+                "Search the Juice WRLD catalog and get automatic tracker "
+                "updates posted to a channel.",
+            ),
+            (
                 "📣 Server Tools — page 5",
                 "Slash commands for posting music releases, sending "
                 "announcements, and checking the bot's latency.",
             ),
             (
                 "💡 Tips & Troubleshooting — page 6",
-                "Requirements, supported sources, traffic estimates, and common fixes.",
-            ),
-            (
-                "🧰 More features — pages 7–12",
-                "AI questions, staff moderation, FreeStuff alerts, Steam/game/driver patch notes, Twitch Drops, member profiles, automatic replies, and the traffic monitor.",
+                "Requirements, supported sources, and fixes for common problems.",
             ),
         ],
     },
@@ -1329,13 +931,15 @@ HELP_PAGES: list[dict] = [
         "summary": "Play songs, upload files, view the queue, skip, stop",
         "color": BRAND_COLOR,
         "description": (
-            "Join a voice channel, then use these commands. VaultBot joins automatically. `~play` uses yt-dlp to prepare a local audio file."
+            "Join a voice channel, then use these commands. The bot joins "
+            "you automatically and starts playing as soon as a song is ready."
         ),
         "fields": [
             (
                 f"`{PREFIX}play <song or URL>`  •  `{PREFIX}p`",
-                "Searches for the song or resolves your URL with yt-dlp, then downloads a local audio file before queueing it. "
-                "If nothing is playing, it starts right away. This command prepares the audio locally.",
+                "Searches for the song (or opens the link you give it), "
+                "downloads the audio, and adds it to the queue. If nothing is "
+                "playing, it starts right away.",
             ),
             (
                 f"`{PREFIX}play` + an attached file",
@@ -1372,7 +976,7 @@ HELP_PAGES: list[dict] = [
                 "Pause the current song and pick it back up right where you left off.",
             ),
             (
-                f"`{PREFIX}volume <0-{MAX_VOLUME_PERCENT}>`  •  `{PREFIX}vol`",
+                f"`{PREFIX}volume <0-100>`  •  `{PREFIX}vol`",
                 "Sets the playback volume for this server. "
                 f"The default is {int(DEFAULT_VOLUME * 100)}%. "
                 "The change applies instantly, even mid-song.",
@@ -1396,11 +1000,54 @@ HELP_PAGES: list[dict] = [
         ],
     },
     {
+        "key": "juice",
+        "aliases": ("jw", "jwsong", "tracker", "juicewrld"),
+        "emoji": "🧃",
+        "title": "Juice WRLD Tools",
+        "summary": "Catalog search and automatic tracker updates",
+        "color": JUICE_COLOR,
+        "description": (
+            "Catalog features powered by the Juice WRLD API. Information only — "
+            "these tools don't play audio."
+        ),
+        "fields": [
+            (
+                f"`{PREFIX}jwsong <search>`",
+                "Searches the Juice WRLD catalog, opens a detailed song embed, "
+                "lets you choose alternate or related matches from a dropdown, and "
+                "shows detailed metadata and lets you search the API file browser for matching audio files.\n"
+                f"Example: `{PREFIX}jwsong lucid dreams`",
+            ),
+            (
+                "`~jwgb [song name]`",
+                "Shows the newest group-buy entry from the WRLD group-buy API when used by itself, "
+                "or searches the archive by name. If the API is unavailable, VaultBot falls back to the saved archive snapshot.",
+            ),
+            (
+                "`~jwlyric <song>` / `~jwlyricsearch <phrase>`",
+                "Shows available lyrics for a catalog song, or searches the catalog for songs containing a lyric phrase.",
+            ),
+            (
+                "`~jwcover <song or album>` / `~jwfiles <song>`",
+                "Searches community cover art or the API file browser for matching audio files.",
+            ),
+            (
+                "📡 Automatic Tracker Feed",
+                "When the tracker channel is configured, VaultBot posts futuristic "
+                "cards for tracker changes and a distinct cyan alert when the API "
+                "marks a catalog entry as created. Update cards show the action, "
+                "editor, changed fields, and notes when available. New-song cards "
+                "include available catalog metadata and artwork.\n"
+                "*A tracker update isn't necessarily a new release.*",
+            ),
+        ],
+    },
+    {
         "key": "slash",
         "aliases": ("server", "admin", "staff", "announce", "musicdrop", "ping"),
         "emoji": "📣",
         "title": "Server Tools (Slash Commands)",
-        "summary": "Music drops, announcements, server stats, Control Center, ping/help",
+        "summary": "/musicdrop, /announce, /ping and /help",
         "color": BRAND_COLOR,
         "description": "Type `/` in the message box to see these. Some are staff-only.",
         "fields": [
@@ -1426,18 +1073,6 @@ HELP_PAGES: list[dict] = [
                 "Enable Server Widget in Server Settings first.",
             ),
             (
-                "`/memberstats` 🔒 Manage Channels",
-                "Creates or refreshes a read-only SERVER STATS category with total member count and combined online/offline counts. It refreshes every five minutes. Enable Presence and Server Members intents in the Discord Developer Portal for accurate counts.",
-            ),
-            (
-                "`/vault` or `~vault` / `~dashboard`",
-                "Opens VaultBot's interactive Control Center for a guided overview of the bot, its tools, and configuration/help sections.",
-            ),
-            (
-                "`~traffic` / `~bandwidth`",
-                "Shows the bot's best-effort rolling 24-hour traffic estimate and whether it can read the container's network counters. It is a monitor only and does not block music; FadeHost's own meter is authoritative.",
-            ),
-            (
                 "`/ping`",
                 "Checks that the bot is online and shows its latency. "
                 "Only you can see the reply.",
@@ -1456,7 +1091,7 @@ HELP_PAGES: list[dict] = [
         "title": "Tips & Troubleshooting",
         "summary": "Requirements, supported sources, and common fixes",
         "color": BRAND_COLOR,
-        "description": "Quick answers if something isn't working the way you expect. Traffic tracking is advisory, and music playback uses the standard music player.",
+        "description": "Quick answers if something isn't working the way you expect.",
         "fields": [
             (
                 "🔊 Before you play",
@@ -1480,10 +1115,6 @@ HELP_PAGES: list[dict] = [
                 "**\"Couldn't play\"** — try the song again or use a different link.\n"
                 "**\"Missing argument\"** — check the usage shown for that "
                 "command on the earlier pages.",
-            ),
-            (
-                "🛡️ Traffic monitor",
-                "Use `~traffic` / `~bandwidth` to see VaultBot's rolling estimate. The monitor does not block or stop music; some hosts do not expose network counters, so FadeHost's own meter is authoritative. Juice WRLD commands use direct compressed streaming, but traffic is still used while audio is playing.",
             ),
             (
                 "🧭 Using this menu",
@@ -1567,7 +1198,7 @@ HELP_PAGES: list[dict] = [
             ("`/drops setup channel:<channel> [role]`", "Choose where Drops alerts are posted and optionally which role is pinged. Requires Manage Server."),
             ("`/drops add game:<name>`  •  `/drops remove game:<name>`", "Follow or unfollow a game. Use `all` with `/drops add` to follow every game in the feed."),
             ("`/drops list`  •  `/drops status`", "View this server's current Drops configuration, followed games, and the health/status of the feed checker."),
-            ("`/drops post game:<name> reward:<details> [ends] [link]`", "Manually post a campaign the feed missed. The optional link must use HTTPS. Configure `DROPS_FEED_URL` on the host for automatic feed polling; optional settings include `DROPS_POLL_MINUTES` (default 120, minimum 60) and `DROPS_DATA_FILE`. The first successful feed read establishes a baseline rather than reposting existing campaigns."),
+            ("`/drops post game:<name> reward:<details> [ends] [link]`", "Manually post a campaign the feed missed. The optional link must use HTTPS. Configure `DROPS_FEED_URL` on the host for automatic feed polling; optional settings include `DROPS_POLL_MINUTES` (default 15, minimum 5) and `DROPS_DATA_FILE`. The first successful feed read establishes a baseline rather than reposting existing campaigns."),
         ],
     },
     {
@@ -1579,10 +1210,10 @@ HELP_PAGES: list[dict] = [
         "color": BRAND_COLOR,
         "description": "Some VaultBot features run automatically and don't need a command.",
         "fields": [
-            ("`~profile [@member]`", "Shows a member profile embed with their avatar, account creation date, server join date, server tenure, roles, and joins/departures recorded since this feature was installed."),
+            ("`~profile [@member]`", "Shows a member profile embed with their avatar, account creation date, server join date, server tenure, roles, VaultBot XP/message stats when available, and joins/departures recorded since this feature was installed."),
             ("Random chat replies", "When enabled, VaultBot may occasionally reply to messages containing greetings (`hello`, `hi`, `hey`, `yo`), morning/night greetings, laughter, or game-related words. It can also react to image uploads with a short reply. Replies are randomized, only considered in servers, and are limited by a per-channel cooldown."),
             ("Current auto-reply settings", "Auto-replies are enabled in this build with a 40% chance after a matching message and a 60-second per-channel cooldown. These values and the reply text can be changed in the script (`AUTO_REPLY_ENABLED`, `AUTO_REPLY_CHANCE`, `AUTO_REPLY_COOLDOWN`, `AUTO_REPLY_KEYWORDS`, and `AUTO_REPLY_IMAGES`)."),
-            ("Other background features", "Patch Notes, FreeStuff, and Twitch Drops each have their own host settings and setup requirements on their dedicated pages. Features that depend on external feeds or API keys remain unavailable until configured and reachable."),
+            ("Other background features", "The Juice WRLD tracker can post unseen tracker changes when `JUICEWRLD_CHANNEL_ID` is configured. Patch Notes, FreeStuff, and Twitch Drops each have their own host settings and setup requirements on their dedicated pages. Features that depend on external feeds or API keys remain unavailable until configured and reachable."),
         ],
     },
 ]
@@ -1611,6 +1242,14 @@ def build_help_embed(index: int) -> discord.Embed:
     )
     for name, value in page["fields"]:
         embed.add_field(name=name, value=value, inline=False)
+
+    # Live status line on the Juice WRLD page.
+    if page["key"] == "juice":
+        if JUICEWRLD_CHANNEL_ID:
+            status = f"✅ Enabled — checks every {JUICEWRLD_POLL_MINUTES} minute(s)."
+        else:
+            status = "❌ Not enabled on this bot (the owner hasn't set a channel)."
+        embed.add_field(name="Tracker status", value=status, inline=False)
 
     embed.set_footer(
         text=f"Page {index + 1} of {len(HELP_PAGES)}  •  Prefix: {PREFIX}  •  Slash: /"
@@ -1707,15 +1346,12 @@ async def send_help(ctx: commands.Context, topic: str = "") -> None:
 @bot.event
 async def on_ready():
     print(f"Bot is online as {bot.user}")
-    _traffic_load_state()
-    if not traffic_guard_task.is_running():
-        traffic_guard_task.start()
     if not member_stats_refresh_task.is_running():
         member_stats_refresh_task.start()
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} global slash command(s): " + ", ".join(cmd.name for cmd in synced))
-        # Optional guild sync makes newly-added commands appear
+        # Optional guild sync makes newly-added commands (such as /xp) appear
         # immediately in the configured server instead of waiting for global propagation.
         guild_id_raw = os.getenv("DISCORD_GUILD_ID", "").strip()
         if guild_id_raw.isdigit():
@@ -1726,6 +1362,17 @@ async def on_ready():
     except Exception as error:
         print(f"Command sync failed: {type(error).__name__}: {error}")
 
+    _load_juicewrld_state()
+    if JUICEWRLD_CHANNEL_ID:
+        if not juicewrld_tracker_task.is_running():
+            juicewrld_tracker_task.start()
+            print(
+                f"[JuiceWRLD] Tracker notifications enabled; "
+                f"channel ID={JUICEWRLD_CHANNEL_ID}, "
+                f"poll interval={JUICEWRLD_POLL_MINUTES} minute(s)."
+            )
+    else:
+        print("[JuiceWRLD] JUICEWRLD_CHANNEL_ID is not set; notifications disabled.")
 
 
 @bot.event
@@ -1790,7 +1437,7 @@ async def on_member_join(member: discord.Member):
         return
     try:
         now = datetime.now(timezone.utc).isoformat()
-        with _profile_connect() as db:
+        with _xp_connect() as db:
             db.execute(
                 """INSERT INTO profile_presence (guild_id, user_id, joins, leaves, first_recorded_join, last_joined)
                    VALUES (?, ?, 1, 0, ?, ?)
@@ -1810,7 +1457,7 @@ async def on_member_remove(member: discord.Member):
     if member.bot:
         return
     try:
-        with _profile_connect() as db:
+        with _xp_connect() as db:
             db.execute(
                 """INSERT INTO profile_presence (guild_id, user_id, joins, leaves, first_recorded_join, last_joined)
                    VALUES (?, ?, 0, 1, NULL, NULL)
@@ -1825,6 +1472,14 @@ async def on_member_remove(member: discord.Member):
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+
+    # XP tracking is separate from existing auto-replies and command handling.
+    # Prefix commands are intentionally excluded from XP farming.
+    if message.guild and not message.content.startswith(PREFIX):
+        try:
+            await _xp_process_message(message)
+        except Exception as error:
+            print(f"[XP] Message tracking failed: {type(error).__name__}: {error}")
 
     # Commands are handled normally and never get an auto-reply.
     if message.content.startswith(PREFIX):
@@ -1881,7 +1536,7 @@ async def profile_command(ctx: commands.Context, member: Optional[discord.Member
     embed = discord.Embed(
         title=f"👤 {target.display_name} • Member Profile",
         description=f"{target.mention}\n`{target}` · ID: `{target.id}`",
-        color=BRAND_COLOR,
+        color=XP_COLOR if "XP_COLOR" in globals() else BRAND_COLOR,
         timestamp=now,
     )
     embed.set_thumbnail(url=target.display_avatar.url)
@@ -1913,19 +1568,31 @@ async def profile_command(ctx: commands.Context, member: Optional[discord.Member
     embed.add_field(name="⏳ Server Tenure", value=tenure, inline=True)
 
     try:
-        with _profile_connect() as db:
+        with _xp_connect() as db:
             row = db.execute(
                 "SELECT joins, leaves FROM profile_presence WHERE guild_id=? AND user_id=?",
+                (ctx.guild.id, target.id),
+            ).fetchone()
+            xp_row = db.execute(
+                "SELECT total_xp, messages FROM xp_profiles WHERE guild_id=? AND user_id=?",
                 (ctx.guild.id, target.id),
             ).fetchone()
     except Exception as error:
         print(f"[Profile] Could not load profile: {type(error).__name__}: {error}")
         row = None
+        xp_row = None
 
     joins = int(row["joins"]) if row else 0
     leaves = int(row["leaves"]) if row else 0
     embed.add_field(name="🔄 Recorded Joins", value=str(joins), inline=True)
     embed.add_field(name="🚪 Recorded Departures", value=str(leaves), inline=True)
+    if xp_row:
+        total_xp = int(xp_row["total_xp"])
+        messages = int(xp_row["messages"])
+        level = _xp_level(total_xp) if "_xp_level" in globals() else "—"
+        embed.add_field(name="✨ VaultBot XP", value=f"Level **{level}** · **{total_xp:,} XP**", inline=True)
+        embed.add_field(name="💬 Tracked Messages", value=f"{messages:,}", inline=True)
+
     roles = [role.mention for role in reversed(target.roles) if not role.is_default()]
     if roles:
         role_text = " · ".join(roles[:10])
@@ -2279,37 +1946,25 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
         return await ctx.send(
             f"Usage: `{PREFIX}play song name or URL` — or attach an audio file to `{PREFIX}play`."
         )
-    requested_label = query.strip() or (ctx.message.attachments[0].filename if ctx.message.attachments else "attached audio")
-    status_message = await ctx.send(embed=_music_status_embed(
-        "🔎 Looking for your song…",
-        f"`◎ SEARCHING`  `⬡ SOURCES`\n{MUSIC_BAR}\n\n"
-        f"Request: **{discord.utils.escape_markdown(requested_label[:180])}**\n"
-        "Checking the source and preparing audio.",
-    ))
     try:
         await ensure_voice(ctx)
     except Exception as exc:
-        await _set_music_status(ctx, status_message, "⚠️ Couldn't start playback", str(exc), color=discord.Color.orange().value)
-        return
+        return await ctx.send(str(exc))
     diag("joined voice, continuing")
 
     attachment = ctx.message.attachments[0] if ctx.message.attachments else None
     if attachment:
         suffix = Path(urlparse(attachment.filename).path).suffix.lower()
         if suffix not in ALLOWED_UPLOAD_SUFFIXES:
-            return await _set_music_status(ctx, status_message, "❌ Unsupported audio file", "Attach an MP3, WAV, Opus, OGG, M4A, or FLAC audio file.", color=discord.Color.red().value)
+            return await ctx.send("Attach an MP3, WAV, Opus, OGG, M4A, or FLAC audio file.")
         if attachment.size > MAX_UPLOAD_MB * 1024 * 1024:
-            return await _set_music_status(ctx, status_message, "❌ File is too large", f"That file is over the bot's {MAX_UPLOAD_MB} MB safety limit.", color=discord.Color.red().value)
-
+            return await ctx.send(f"That file is over the bot's {MAX_UPLOAD_MB} MB safety limit.")
         if not query:
             query = attachment.filename
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
                 path = temp.name
             await attachment.save(path)
-            TEMP_FILES.add(path)
-            actual_upload_bytes = Path(path).stat().st_size
-            _traffic_record_bytes(actual_upload_bytes, "attachment_download_bytes")
             TEMP_FILES.add(path)
             track = Track(
                 title=attachment.filename,
@@ -2318,10 +1973,10 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
                 local_path=path,
                 source_name="uploaded file",
             )
-            await queue_track(ctx, track, status_message=status_message)
+            await queue_track(ctx, track)
         except Exception as exc:
             clean_temp_file(locals().get("path"))
-            await _set_music_status(ctx, status_message, "❌ Couldn't save that upload", str(exc), color=discord.Color.red().value)
+            await ctx.send(f"Couldn't save that upload: {exc}")
         return
 
     if not query.strip():
@@ -2332,19 +1987,10 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
     # Spotify and Apple Music links may provide metadata or a playable match,
     # but direct catalog audio streaming is not guaranteed or bypassed here.
     await ctx.typing()
-
-    async def _on_play_found(found_title: str) -> None:
-        await _set_music_status(
-            ctx, status_message, "✅ MATCH FOUND  //  OPENING STREAM",
-            f"`◈ MATCH`  `⬡ LIVE STREAM`\n{MUSIC_BAR}\n\n"
-            f"**{discord.utils.escape_markdown(found_title[:180])}**\nOpening a compressed live stream and adding it to the shared queue…",
-            color=MUSIC_COLOR.value,
-        )
-
     try:
-        track = await extract_track(query.strip(), ctx.author.display_name, on_found=_on_play_found)
+        track = await extract_track(query.strip(), ctx.author.display_name)
         diag(f"track ready: {track.title!r}, queueing")
-        await queue_track(ctx, track, status_message=status_message)
+        await queue_track(ctx, track)
     except Exception as exc:
         error_text = str(exc)
         print(f"yt-dlp error: {error_text}", flush=True)
@@ -2354,17 +2000,18 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
             or "sign in to confirm" in lower_error
             or "login required" in lower_error
         ):
-            await _set_music_status(
-                ctx, status_message, "⚠️ Source requires sign-in",
-                "YouTube blocked this request. Try a different public YouTube URL or a SoundCloud link.",
-                color=discord.Color.orange().value,
+            await ctx.send(
+                "⚠️ YouTube requires sign-in for this request. VaultBot is configured "
+                "to try alternate public YouTube clients without cookies, but YouTube "
+                "can still block particular tracks or this host. Try a different "
+                "public YouTube URL or a SoundCloud link."
             )
         else:
-            await _set_music_status(
-                ctx, status_message, "❌ Couldn't find playable audio",
-                "Try a public YouTube/SoundCloud URL or a song title.\n"
-                f"Details: {error_text[:250]}",
-                color=discord.Color.red().value,
+            await ctx.send(
+                "I couldn't find a playable stream for that request. "
+                "For Spotify/Apple Music, direct playback may not be available; "
+                "try a public YouTube/SoundCloud URL or a song title.\n"
+                f"Details: {error_text[:250]}"
             )
 
 
@@ -2375,13 +2022,10 @@ async def queue_command(ctx: commands.Context):
     guild_id = ctx.guild.id
     tracks = list(get_queue(guild_id))
     current = current_tracks.get(guild_id)
-    embed = discord.Embed(title="◈  AUDIO QUEUE", color=MUSIC_COLOR)
-    embed.set_author(name=MUSIC_AUTHOR)
-    embed.description = f"`◈ QUEUE`  `▣ {len(tracks)} TRACK{'S' if len(tracks) != 1 else ''}`\n{MUSIC_BAR}"
-    footer = MUSIC_FOOTER
+    embed = discord.Embed(title="🎵 Music Queue", color=BRAND_COLOR)
     if current:
         embed.add_field(
-            name="▸  NOW PLAYING",
+            name="Now playing",
             value=f"[{discord.utils.escape_markdown(current.title)}]({current.webpage_url})",
             inline=False,
         )
@@ -2391,13 +2035,12 @@ async def queue_command(ctx: commands.Context):
             f"— `{format_duration(t.duration)}`"
             for i, t in enumerate(tracks[:10], start=1)
         ]
-        embed.add_field(name=f"▸  UP NEXT  ({len(tracks)} QUEUED)", value="\n".join(lines), inline=False)
+        embed.add_field(name=f"Up next ({len(tracks)} queued)", value="\n".join(lines), inline=False)
         if len(tracks) > 10:
-            footer = f"{MUSIC_FOOTER}  •  +{len(tracks) - 10} more"
+            embed.set_footer(text=f"And {len(tracks) - 10} more track(s)")
     elif not current:
-        embed.description += "\n\nThe queue is empty."
-    embed.add_field(name="▣  LOOP", value=f"`{str(loop_modes.get(guild_id, 'off')).upper()}`", inline=True)
-    embed.set_footer(text=footer)
+        embed.description = "The queue is empty."
+    embed.add_field(name="Loop mode", value=loop_modes.get(guild_id, "off"), inline=True)
     await ctx.send(embed=embed)
 
 
@@ -2415,9 +2058,8 @@ async def skip_command(ctx: commands.Context):
 async def stop_command(ctx: commands.Context):
     if not ctx.guild:
         return
-    guild_id = ctx.guild.id
     voice = ctx.guild.voice_client
-    get_queue(guild_id).clear()
+    get_queue(ctx.guild.id).clear()
     loop_modes[ctx.guild.id] = "off"
     current = current_tracks.pop(ctx.guild.id, None)
     if current:
@@ -2453,14 +2095,13 @@ async def resume_command(ctx: commands.Context):
 async def volume_command(ctx: commands.Context, percent: int):
     if not ctx.guild:
         return
-    if not 0 <= percent <= MAX_VOLUME_PERCENT:
-        return await ctx.send(f"Choose a volume from 0 to {MAX_VOLUME_PERCENT}.")
+    if not 0 <= percent <= 100:
+        return await ctx.send("Choose a volume from 0 to 100.")
     volumes[ctx.guild.id] = percent / 100
     voice = ctx.guild.voice_client
     if voice and voice.source and isinstance(voice.source, discord.PCMVolumeTransformer):
         voice.source.volume = percent / 100
-    note = " Above 100% is amplified and may sound distorted." if percent > 100 else ""
-    await ctx.send(f"🔊 Volume set to **{percent}%**.{note}")
+    await ctx.send(f"🔊 Volume set to **{percent}%**.")
 
 
 @bot.command(name="nowplaying", aliases=["np", "current"])
@@ -2500,59 +2141,1258 @@ async def leave_command(ctx: commands.Context):
     await ctx.send("👋 Disconnected from voice.")
 
 
-# ---- Leave empty voice channels (stops streaming audio to nobody) ----
-_voice_idle_tasks: dict = {}
+# ---- Juice WRLD ----
+
+def _jw_plain(value, fallback="", limit=900):
+    """Convert API metadata to safe, readable text for Discord embeds."""
+    if value is None:
+        return fallback
+    if isinstance(value, (list, tuple, set)):
+        parts = [_jw_plain(item, "", 250) for item in value]
+        text = ", ".join(part for part in parts if part)
+    elif isinstance(value, dict):
+        parts = [f"{key}: {_jw_plain(item, '', 200)}" for key, item in value.items()
+                 if item not in (None, "", [], {})]
+        text = "\n".join(parts)
+    else:
+        text = str(value).strip()
+    text = text.replace("@", "@\u200b").strip()
+    return text[:limit]
 
 
-def _humans_in_channel(channel) -> int:
-    return sum(1 for member in getattr(channel, "members", []) if not member.bot)
+def _jw_has_value(value):
+    return value not in (None, "", [], {}, False)
 
 
-async def _leave_when_empty(guild_id: int) -> None:
-    try:
-        await asyncio.sleep(VOICE_IDLE_LEAVE_SECONDS)
-        guild = bot.get_guild(guild_id)
-        voice = guild.voice_client if guild else None
-        if not voice or not voice.channel or _humans_in_channel(voice.channel) > 0:
+def _jw_song_score(song, query):
+    """Rank exact title and alternate-title matches above broad search matches."""
+    query_norm = "".join(ch.casefold() for ch in query if ch.isalnum())
+    names = [song.get("name", "")]
+    titles = song.get("track_titles") or []
+    if isinstance(titles, str):
+        titles = [titles]
+    names.extend(titles if isinstance(titles, list) else [])
+    normalized = ["".join(ch.casefold() for ch in str(name) if ch.isalnum())
+                  for name in names if name]
+    if query_norm and query_norm in normalized:
+        return 100
+    if query_norm and any(query_norm in name for name in normalized):
+        return 80
+    if query_norm and any(name in query_norm for name in normalized if name):
+        return 60
+    return 10
+
+
+def _build_juicewrld_song_embed(song, query=""):
+    """Build a detailed song page from whichever metadata the API supplies."""
+    name = _juicewrld_safe(song.get("name"), "Unknown title", 250)
+    embed = discord.Embed(title=f"🎵 {name}", color=JUICE_COLOR)
+
+    category = _jw_plain(song.get("category"), "Unknown")
+    artist = _jw_plain(song.get("credited_artists"), "Juice WRLD")
+    summary = [f"**Artist:** {artist}", f"**Category:** {category}"]
+    era = song.get("era")
+    if isinstance(era, dict):
+        era_name = _jw_plain(era.get("name"), "")
+        era_period = _jw_plain(era.get("time_frame"), "")
+        if era_name:
+            summary.append(f"**Era:** {era_name}" + (f" — {era_period}" if era_period else ""))
+    elif _jw_has_value(era):
+        summary.append(f"**Era:** {_jw_plain(era)}")
+    album = _jw_plain(song.get("album"), "")
+    if album:
+        summary.append(f"**Album:** {album}")
+    if _jw_has_value(song.get("version_title")):
+        summary.append(f"**Version:** {_jw_plain(song.get('version_title'), limit=150)}")
+    embed.description = "\n".join(summary)[:4000]
+
+    # The API returns a large catalogue object, but Discord embeds have strict
+    # field and total-character limits. Include as much non-empty metadata as fits.
+    fields = [
+        ("Alternate titles", song.get("track_titles")),
+        ("Producers", song.get("producers")),
+        ("Engineers", song.get("engineers")),
+        ("Recording locations", song.get("recording_locations")),
+        ("Recording dates", song.get("record_dates")),
+        ("Track length", song.get("length")),
+        ("Release date", song.get("release_date")),
+        ("Preview date", song.get("preview_date")),
+        ("Other dates", song.get("dates")),
+        ("Leak information", "\n".join(
+            f"{label}: {_jw_plain(song.get(key), '', 250)}"
+            for label, key in (("Date leaked", "date_leaked"), ("Leak type", "leak_type"))
+            if _jw_has_value(song.get(key))
+        )),
+        ("File names", song.get("file_names")),
+        ("Instrumentals", song.get("instrumentals") or song.get("instrumental_names")),
+        ("Session titles", song.get("session_titles")),
+        ("Session tracking", song.get("session_tracking")),
+        ("Snippets", song.get("snippets")),
+        ("Additional information", song.get("additional_information")),
+        ("Notes", song.get("notes")),
+        ("Group-buy information", song.get("groupbuy_info")),
+        ("Version records", song.get("versions")),
+    ]
+
+    used_chars = len(embed.title or "") + len(embed.description or "")
+    for field_name, raw_value in fields:
+        if not _jw_has_value(raw_value):
+            continue
+        value = _jw_plain(raw_value, "", 900)
+        if not value:
+            continue
+        if used_chars + len(field_name) + len(value) > 5700 or len(embed.fields) >= 24:
+            break
+        embed.add_field(name=field_name, value=value, inline=False)
+        used_chars += len(field_name) + len(value)
+
+    if song.get("lyrics"):
+        lyrics = _jw_plain(song.get("lyrics"), "", 650)
+        if lyrics and used_chars + len("Lyrics preview") + len(lyrics) < 5900 and len(embed.fields) < 25:
+            embed.add_field(name="Lyrics preview", value=lyrics + ("…" if len(str(song.get("lyrics", ""))) > 650 else ""), inline=False)
+            used_chars += len(lyrics)
+
+    image_url = song.get("image_url")
+    if isinstance(image_url, str) and image_url.strip():
+        if image_url.startswith("/"):
+            image_url = "https://juicewrldapi.com" + image_url
+        if image_url.startswith("https://") or image_url.startswith("http://"):
+            embed.set_thumbnail(url=image_url)
+
+    catalog_id = song.get("public_id") or song.get("id")
+    footer_parts = []
+    if catalog_id is not None:
+        footer_parts.append(f"Catalog ID: {catalog_id}")
+    if song.get("id") is not None:
+        footer_parts.append(f"Database ID: {song.get('id')}")
+    footer_parts.append("Metadata: Juice WRLD Community API")
+    embed.set_footer(text=" • ".join(footer_parts)[:2048])
+    return embed
+
+
+def _jw_file_path(item):
+    """Extract a path relative to the API's compilation root."""
+    if isinstance(item, str):
+        # A bare name is only useful if the API itself returned a relative path.
+        return item.strip() if "/" in item.strip() else None
+    if not isinstance(item, dict):
+        return None
+    for key in ("path", "file_path", "relative_path", "filepath", "key"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    # Some listings return `id` as the relative path.
+    value = item.get("id")
+    if isinstance(value, str) and "/" in value:
+        return value.strip()
+    return None
+
+
+def _jw_file_is_directory(item):
+    if not isinstance(item, dict):
+        return False
+    if item.get("is_directory") is True or item.get("is_dir") is True or item.get("directory") is True:
+        return True
+    return str(item.get("type", "")).casefold() in {"directory", "dir", "folder"}
+
+
+def _jw_audio_candidates(items, query, limit=25):
+    """Filter API file-list entries to likely matching audio files."""
+    suffixes = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus", ".aac"}
+    q = "".join(ch.casefold() for ch in query if ch.isalnum())
+    matches = []
+    seen = set()
+    for item in items:
+        if _jw_file_is_directory(item):
+            continue
+        path = _jw_file_path(item)
+        if not path or Path(path).suffix.casefold() not in suffixes:
+            continue
+        normalized = "".join(ch.casefold() for ch in Path(path).stem if ch.isalnum())
+        if q and q not in normalized and normalized not in q:
+            # Also allow one meaningful word to match if title variants differ.
+            words = ["".join(ch.casefold() for ch in w if ch.isalnum())
+                     for w in query.split()]
+            words = [w for w in words if len(w) >= 4]
+            if not words or not any(w in normalized for w in words):
+                continue
+        if path in seen:
+            continue
+        seen.add(path)
+        # Exact/close filename matches first.
+        score = 0 if q == normalized else (1 if q in normalized else 2)
+        matches.append((score, path, item))
+    matches.sort(key=lambda row: (row[0], row[1].casefold()))
+    return [(path, item) for _, path, item in matches[:limit]]
+
+
+def _jw_download_url(path, compressed=True):
+    """Build a URL to the API's documented file endpoint for an API-listed path."""
+    from urllib.parse import quote
+    endpoint = "files/download-compressed/" if compressed else "files/download/"
+    params = {"path": path}
+    if compressed:
+        params["bitrate"] = "160k"
+    return f"{JUICEWRLD_API_BASE}/{endpoint}?{urlencode(params)}"
+
+
+class JuiceWRLDFileSelect(discord.ui.Select):
+    def __init__(self, files, owner_id, song_title):
+        self.files = files
+        self.owner_id = owner_id
+        self.song_title = song_title
+        options = []
+        for index, (path, item) in enumerate(files[:25]):
+            filename = Path(path).name
+            size = item.get("size") if isinstance(item, dict) else None
+            description = str(size) + " bytes" if isinstance(size, (int, float)) else str(Path(path).parent)
+            options.append(discord.SelectOption(
+                label=filename[:100] or f"Audio file {index + 1}",
+                value=str(index),
+                description=description[:100] or "Audio file"
+            ))
+        super().__init__(
+            placeholder="Choose the matching audio file…",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the person who requested the search can choose a file.",
+                ephemeral=True
+            )
             return
-        # Same cleanup as ~leave.
-        get_queue(guild_id).clear()
-        loop_modes[guild_id] = "off"
-        current = current_tracks.pop(guild_id, None)
-        if current:
-            clean_temp_file(current.local_path)
-        if voice.is_playing() or voice.is_paused():
-            voice.stop()
-        await voice.disconnect()
-        print(f"[Voice] Left {guild.name!r}: nobody listening for {VOICE_IDLE_LEAVE_SECONDS}s (saves data).", flush=True)
+        try:
+            index = int(self.values[0])
+            path, metadata = self.files[index]
+            size = metadata.get("size") if isinstance(metadata, dict) else None
+            embed = discord.Embed(
+                title="⬇️ Audio download",
+                description=(f"**Song:** {discord.utils.escape_markdown(self.song_title[:200])}\n"
+                            f"**File:** `{Path(path).name[:200]}`\n"
+                            f"**Path:** `{path[:800]}`\n\n"
+                            "Use the button below to download the selected file from the API."),
+                color=JUICE_COLOR
+            )
+            if isinstance(size, (int, float)):
+                embed.add_field(name="File size", value=f"{size / (1024 * 1024):.2f} MB", inline=True)
+            view = discord.ui.View(timeout=180)
+            view.add_item(discord.ui.Button(
+                label="Download MP3",
+                style=discord.ButtonStyle.link,
+                url=_jw_download_url(path, compressed=True),
+                emoji="⬇️"
+            ))
+            view.add_item(discord.ui.Button(
+                label="Original audio file",
+                style=discord.ButtonStyle.link,
+                url=_jw_download_url(path, compressed=False),
+                emoji="🎧"
+            ))
+            await interaction.response.edit_message(embed=embed, view=view)
+        except (IndexError, ValueError, TypeError) as exc:
+            print(f"[JuiceWRLD] Invalid file selection: {exc}")
+            await interaction.response.send_message(
+                "That file selection was invalid. Run the song search again.",
+                ephemeral=True
+            )
+
+
+class JuiceWRLDFindFilesButton(discord.ui.Button):
+    def __init__(self, owner_id, song):
+        super().__init__(
+            label="Find downloadable files",
+            style=discord.ButtonStyle.primary,
+            emoji="🔎"
+        )
+        self.owner_id = owner_id
+        self.song = song
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the person who ran the search can find files for this song.",
+                ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        title = _juicewrld_safe(self.song.get("name"), "Juice WRLD song", 200)
+        try:
+            # Search the API's actual file browser; song metadata alone doesn't
+            # guarantee that a file path exists for the catalog entry.
+            payload = await _juicewrld_api_get("/files/browse/", params={"search": title})
+            entries = _juicewrld_items(payload)
+            matches = _jw_audio_candidates(entries, title)
+
+            # Some API deployments provide search only on browse, while others
+            # return a directory summary. Fall back to the flat file list.
+            if not matches:
+                payload = await _juicewrld_api_get("/files/list-all/")
+                entries = _juicewrld_items(payload)
+                matches = _jw_audio_candidates(entries, title)
+
+            if not matches:
+                await interaction.followup.send(
+                    f"I couldn't find an audio file matching **{title}** in the API file listing. "
+                    "The catalog entry may not have an associated file, or the file browser may use a different path format.",
+                    ephemeral=True
+                )
+                return
+
+            view = discord.ui.View(timeout=180)
+            view.add_item(JuiceWRLDFileSelect(matches, self.owner_id, title))
+            await interaction.followup.send(
+                content=f"Found **{len(matches)}** matching audio file(s) for **{title}**. Choose the exact file:",
+                view=view,
+                ephemeral=True
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+            print(f"[JuiceWRLD] File search failed: {exc}")
+            await interaction.followup.send(
+                "The Juice WRLD file browser couldn't be reached. Try again later.",
+                ephemeral=True
+            )
+
+
+class JuiceWRLDSongSelect(discord.ui.Select):
+    def __init__(self, songs, owner_id):
+        self.owner_id = owner_id
+        options = []
+        for song in songs[:25]:
+            song_id = song.get("id")
+            if song_id is None:
+                continue
+            title = _juicewrld_safe(song.get("name"), "Unknown title", 75)
+            category = _juicewrld_safe(song.get("category"), "Unknown category", 35)
+            version = song.get("version_title")
+            if version:
+                title = f"{title} — {_juicewrld_safe(version, limit=20)}"[:100]
+            era = song.get("era")
+            if isinstance(era, dict):
+                era = era.get("name")
+            description_parts = [category]
+            if era:
+                description_parts.append(_juicewrld_safe(era, limit=30))
+            if song.get("album"):
+                description_parts.append(_juicewrld_safe(song.get("album"), limit=30))
+            options.append(discord.SelectOption(
+                label=title[:100],
+                value=str(song_id),
+                description=" • ".join(description_parts)[:100]
+            ))
+        super().__init__(
+            placeholder="Choose another matching song or version…",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the person who ran the search can change this song page.",
+                ephemeral=True
+            )
+            return
+
+        try:
+            song_id = int(self.values[0])
+            payload = await _juicewrld_api_get(f"/songs/{song_id}/")
+            if not isinstance(payload, dict) or not payload.get("id"):
+                raise ValueError("API returned no song detail object")
+            selected = next((item for item in self.view.songs
+                             if str(item.get("id")) == str(song_id)), {})
+            merged = dict(selected)
+            merged.update(payload)
+            embed = _build_juicewrld_song_embed(merged)
+            # Rebuild the view so the download button corresponds to the song
+            # currently displayed, not the song that was selected previously.
+            new_view = JuiceWRLDSongView(self.view.songs, self.owner_id, merged)
+            await interaction.response.edit_message(embed=embed, view=new_view)
+            new_view.message = interaction.message
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+            print(f"[JuiceWRLD] Detail lookup failed: {exc}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "I couldn't load that song's full details. Please try selecting it again.",
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    "I couldn't load that song's full details. Please try selecting it again.",
+                    ephemeral=True
+                )
+
+
+class JuiceWRLDSongView(discord.ui.View):
+    def __init__(self, songs, owner_id, selected_song=None):
+        super().__init__(timeout=180)
+        self.songs = songs
+        self.owner_id = owner_id
+        self.message = None
+        select = JuiceWRLDSongSelect(songs, owner_id)
+        if select.options:
+            self.add_item(select)
+
+        if selected_song:
+            self.add_item(JuiceWRLDFindFilesButton(owner_id, selected_song))
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if getattr(self, "message", None):
+            try:
+                await self.message.edit(view=self)
+            except (discord.HTTPException, discord.NotFound):
+                pass
+
+
+# juicewrld.io group-buy archive. It is an informational archive; it does not
+# expose or link sellers/payment methods.
+JUICEWRLD_GROUP_BUYS_URL = "https://juicewrld.io/groupbuys"
+# Save a successful archive read so a temporary Cloudflare block does not make
+# the command unavailable after the first successful lookup. Use /data on hosts
+# that provide persistent storage; otherwise fall back to the system temp dir.
+JUICEWRLD_GROUP_BUY_CACHE_FILE = Path(os.getenv(
+    "JUICEWRLD_GROUP_BUY_CACHE_FILE",
+    str(Path("/data/juicewrld_groupbuys_cache.json")
+        if Path("/data").exists()
+        else Path(tempfile.gettempdir()) / "juicewrld_groupbuys_cache.json")
+))
+
+# Small bootstrap snapshot taken from the visible archive on 2026-10-27. This is
+# used only when juicewrld.io blocks requests AND no saved cache exists. The
+# snapshot is intentionally labeled as a fallback in Discord; it is not live.
+_JUICEWRLD_GROUP_BUY_BOOTSTRAP = [
+    {
+        "title": "Calm Down",
+        "url": "https://juicewrld.io/song/calm-down-out",
+        "text": "Calm Down Murciélago Leaked aka Murciélago Hosted by Bravura Finished Oct 24, 2026",
+        "goal": "$20,000", "outcome": "Finished", "date": "Oct 24, 2026",
+    },
+    {
+        "title": "Wraith",
+        "url": "https://juicewrld.io/song/wraith-drfl",
+        "text": "Wraith Leaked Hosted by Bravura Finished Oct 16, 2026",
+        "goal": "$10,000", "outcome": "Finished", "date": "Oct 16, 2026",
+    },
+    {
+        "title": "Boast",
+        "url": JUICEWRLD_GROUP_BUYS_URL,
+        "text": "Boast Leaked Party Song is unbounced Finished Sep 30, 2026",
+        "goal": "$8,500", "outcome": "Finished", "date": "Sep 30, 2026",
+    },
+    {
+        "title": "Introvert",
+        "url": JUICEWRLD_GROUP_BUYS_URL,
+        "text": "Introvert Luv 2 Hosted by strives in OG File Hub Finished Sep 23, 2026",
+        "goal": "$2,500", "outcome": "Finished", "date": "Sep 23, 2026",
+    },
+    {
+        "title": "Blink-182 & Devil Horns ProTools Session",
+        "url": JUICEWRLD_GROUP_BUYS_URL,
+        "text": "Blink-182 Devil Horns ProTools Session Finished Jun 3, 2026",
+        "goal": "$3,000", "outcome": "Finished", "date": "Jun 3, 2026",
+    },
+    {
+        "title": "OKAY!! ProTools Session",
+        "url": JUICEWRLD_GROUP_BUYS_URL,
+        "text": "OKAY!! ProTools Session Group buy from strives Finished May 14, 2026",
+        "goal": "$3,000", "outcome": "Finished", "date": "May 14, 2026",
+    },
+    {
+        "title": "Open Up",
+        "url": JUICEWRLD_GROUP_BUYS_URL,
+        "text": "Open Up Make The News Blind Finished Mar 14, 2026",
+        "goal": "$15,000", "outcome": "Finished", "date": "Mar 14, 2026",
+    },
+    {
+        "title": "Mula*",
+        "url": JUICEWRLD_GROUP_BUYS_URL,
+        "text": "Mula 1772 Moon Friends Blind Finished Feb 9, 2026",
+        "goal": "$10,000", "outcome": "Finished", "date": "Feb 9, 2026",
+    },
+    {
+        "title": "Cold Winters*",
+        "url": JUICEWRLD_GROUP_BUYS_URL,
+        "text": "Cold Winters FIFA Blind Finished Feb 4, 2026",
+        "goal": "$18,250", "outcome": "Finished", "date": "Feb 4, 2026",
+    },
+    {
+        "title": "Be Here*",
+        "url": JUICEWRLD_GROUP_BUYS_URL,
+        "text": "Be Here In The Mix Blind Finished Jan 21, 2026",
+        "goal": "$15,000", "outcome": "Finished", "date": "Jan 21, 2026",
+    },
+]
+
+
+def _load_juicewrld_group_buy_fallback():
+    """Prefer a previously fetched archive; otherwise return the bootstrap snapshot."""
+    try:
+        cached = json.loads(JUICEWRLD_GROUP_BUY_CACHE_FILE.read_text(encoding="utf-8"))
+        if isinstance(cached, list):
+            valid = [
+                item for item in cached
+                if isinstance(item, dict) and item.get("title") and item.get("url")
+            ]
+            if valid:
+                return valid
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    # Copy the dicts so callers can't mutate the module-level bootstrap data.
+    return [dict(item) for item in _JUICEWRLD_GROUP_BUY_BOOTSTRAP]
+
+
+def _save_juicewrld_group_buy_cache(items):
+    """Cache parsed public archive metadata; cache failures must not break the command."""
+    try:
+        path = JUICEWRLD_GROUP_BUY_CACHE_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(path)
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"[JuiceWRLD] Could not save group-buy cache: {exc!r}")
+
+
+class _JuiceWRLDGroupBuyHTMLParser(HTMLParser):
+    """Extract group-buy table rows from juicewrld.io without third-party parsers."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.rows = []
+        self.links = []
+        self._row = None
+        self._anchor = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag.lower() == "tr":
+            if self._row is not None:
+                self._finish_row()
+            self._row = {"parts": [], "links": []}
+        if tag.lower() == "a":
+            link = {"href": attrs.get("href", ""), "parts": []}
+            self.links.append(link)
+            if self._row is not None:
+                self._row["links"].append(link)
+            self._anchor = link
+
+    def handle_data(self, data):
+        if self._row is not None:
+            self._row["parts"].append(data)
+        if self._anchor is not None:
+            self._anchor["parts"].append(data)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag == "a":
+            self._anchor = None
+        elif tag == "tr":
+            self._finish_row()
+
+    def _finish_row(self):
+        if self._row is not None:
+            text = " ".join(" ".join(self._row["parts"]).split())
+            if text:
+                self.rows.append({"text": text, "links": self._row["links"]})
+        self._row = None
+
+
+def _juicewrld_group_buy_from_row(row):
+    """Normalize one table row into the fields used by the Discord embed."""
+    row_text = row.get("text", "")
+    title = None
+    song_url = None
+    for link in row.get("links", []):
+        href = (link.get("href") or "").strip()
+        link_text = " ".join(" ".join(link.get("parts", [])).split())
+        if not href or not link_text or link_text.lower() == "image":
+            continue
+        absolute = urljoin(JUICEWRLD_GROUP_BUYS_URL, href)
+        path = urlparse(absolute).path.lower()
+        if "/song/" in path or "/session/" in path or "/version/" in path:
+            title = link_text
+            song_url = absolute
+            break
+    if not title:
+        return None
+
+    amounts = re.findall(r"\$\s?[\d,]+(?:\.\d{1,2})?", row_text)
+    goal = amounts[-1].replace(" ", "") if amounts else "Not listed"
+
+    outcome_match = re.search(r"\b(Not\s+finished|Finished|Unknown)\b", row_text, re.IGNORECASE)
+    outcome = "Not recorded"
+    if outcome_match:
+        outcome = re.sub(r"\s+", " ", outcome_match.group(1)).title()
+
+    date_match = re.search(
+        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b",
+        row_text,
+        re.IGNORECASE,
+    )
+    date_text = date_match.group(0).replace(",", "") if date_match else "Date not listed"
+
+    return {
+        "title": title[:250],
+        "url": song_url,
+        "text": row_text[:1200],
+        "goal": goal,
+        "outcome": outcome,
+        "date": date_text,
+    }
+
+
+async def _fetch_juicewrld_group_buys():
+    # Keep a live lookup quick: Cloudflare may reject non-browser requests.
+    timeout = aiohttp.ClientTimeout(total=8)
+    headers = {
+        "User-Agent": "VaultBot/1.0 (Discord archive lookup)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.get(JUICEWRLD_GROUP_BUYS_URL, allow_redirects=True) as response:
+            response.raise_for_status()
+            source = await response.text()
+
+    parser = _JuiceWRLDGroupBuyHTMLParser()
+    parser.feed(source)
+    parser.close()
+    items = []
+    for row in parser.rows:
+        item = _juicewrld_group_buy_from_row(row)
+        if item:
+            items.append(item)
+
+    # Defensive fallback if the website changes away from table rows: still
+    # produce a useful latest-entry link from the first song links we can parse.
+    if not items:
+        seen = set()
+        for link in parser.links:
+            href = (link.get("href") or "").strip()
+            title = " ".join(" ".join(link.get("parts", [])).split())
+            if not href or not title or title.lower() == "image":
+                continue
+            absolute = urljoin(JUICEWRLD_GROUP_BUYS_URL, href)
+            path = urlparse(absolute).path.lower()
+            if not any(route in path for route in ("/song/", "/session/", "/version/")):
+                continue
+            if absolute in seen:
+                continue
+            seen.add(absolute)
+            items.append({
+                "title": title[:250], "url": absolute, "text": title,
+                "goal": "See archive", "outcome": "See archive", "date": "See archive",
+            })
+            if len(items) >= 30:
+                break
+    if items:
+        _save_juicewrld_group_buy_cache(items)
+    return items
+
+
+# The default WRLD-bot endpoint can lag the public archive. It can be overridden
+# by the host if a maintained, current group-buy JSON endpoint becomes available.
+JUICEWRLD_GROUP_BUY_API_URL = os.getenv(
+    "JUICEWRLD_GROUP_BUY_API_URL",
+    "https://wrld.pure0.lol/api/groupbuys",
+).strip()
+_JWGB_LIVE_RETRY_AT = 0.0
+
+
+async def _jw_get_json_url(url: str, params: Optional[dict] = None):
+    """Fetch JSON from an absolute API URL without adding browser-challenge workarounds."""
+    timeout = aiohttp.ClientTimeout(total=18)
+    headers = {"Accept": "application/json", "User-Agent": "VaultBot/1.0 (Juice WRLD lookup)"}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.get(url, params=params, allow_redirects=True) as response:
+            response.raise_for_status()
+            return await response.json(content_type=None)
+
+
+def _jw_gb_data(payload):
+    if isinstance(payload, dict):
+        entries = payload.get("entries")
+        if isinstance(entries, list):
+            return [item for item in entries if isinstance(item, dict)]
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
+
+def _jw_normalize_match(value):
+    return "".join(ch.casefold() for ch in str(value or "") if ch.isalnum())
+
+
+def _jw_groupbuy_score(query: str, entry: dict) -> int:
+    q = _jw_normalize_match(query)
+    if not q:
+        return 0
+    names = [entry.get("title"), *(entry.get("alternates") or []), *(entry.get("family") or [])]
+    best = 0
+    for name in names:
+        norm = _jw_normalize_match(name)
+        if not norm:
+            continue
+        if norm == q:
+            return 100
+        if q in norm:
+            best = max(best, 92)
+        elif norm in q:
+            best = max(best, 82)
+        else:
+            best = max(best, round(difflib.SequenceMatcher(None, q, norm).ratio() * 75))
+    return best
+
+
+def _jw_groupbuy_date(entry: dict):
+    gb = entry.get("gb") or entry.get("group") or entry.get("groupbuy_info") or {}
+    if not isinstance(gb, dict):
+        gb = {}
+    raw = gb.get("start_date") or entry.get("start_date") or entry.get("date") or entry.get("created_at") or ""
+    raw = str(raw).strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%b %d, %Y", "%B %d, %Y", "%b %d %Y", "%B %d %Y", "%m/%d/%Y", "%d %b %Y"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _jw_groupbuy_embed(entry: dict, *, latest: bool, stale: bool = False) -> discord.Embed:
+    gb = entry.get("gb") or entry.get("group") or entry.get("groupbuy_info") or {}
+    if not isinstance(gb, dict):
+        gb = {}
+    title = str(entry.get("title") or entry.get("name") or "Unknown group buy").strip()
+    project = entry.get("project") or "Not listed"
+    price = gb.get("price")
+    if isinstance(price, (int, float)):
+        price_text = f"${price:,.0f}" if float(price).is_integer() else f"${price:,.2f}"
+    else:
+        price_text = str(price).strip() if price not in (None, "") else "Not listed"
+        if price_text and not price_text.startswith("$") and price_text != "Not listed":
+            price_text = "$" + price_text
+    start_date = str(gb.get("start_date") or entry.get("start_date") or "Not listed")
+    end_date = str(gb.get("end_date") or entry.get("end_date") or "Not listed")
+    finished = gb.get("finished", entry.get("finished"))
+    if finished is True:
+        status = "Finished"
+    elif finished is False:
+        status = "Not finished"
+    else:
+        status = str(finished or "Not recorded")
+    ogfile = gb.get("ogfile", False)
+    blind = entry.get("blind", False)
+    notes = str(entry.get("additional_info") or gb.get("notes") or gb.get("additional_info") or "").strip()
+    family = entry.get("family") or []
+    alternates = entry.get("alternates") or []
+    link = entry.get("url") or "https://juicewrld.io/groupbuys"
+    heading = f"🧃 {'Latest ' if latest else ''}Juice WRLD Group Buy: {title}"
+    description = f"**Archive entry:** [{discord.utils.escape_markdown(title[:180])}]({link})\nHistorical group-buy information only; no seller or payment links are provided."
+    if stale:
+        description += "\n\n⚠️ **Backup data:** the live API and archive are unavailable; this result may be outdated."
+    embed = discord.Embed(title=heading[:256], url=link, description=description, color=JUICE_COLOR)
+    embed.add_field(name="Goal / Price", value=price_text[:1024], inline=True)
+    embed.add_field(name="Status", value=status[:1024], inline=True)
+    embed.add_field(name="Era / Project", value=str(project)[:1024], inline=True)
+    embed.add_field(name="Start date", value=start_date[:1024], inline=True)
+    embed.add_field(name="End date", value=end_date[:1024], inline=True)
+    embed.add_field(name="Original file", value="Yes" if ogfile is True else ("No" if ogfile is False else str(ogfile))[:1024], inline=True)
+    embed.add_field(name="Blind buy", value="Yes" if blind is True else ("No" if blind is False else str(blind))[:1024], inline=True)
+    extra = []
+    if alternates:
+        extra.append("**AKA:** " + ", ".join(str(x) for x in alternates[:8]))
+    if family:
+        extra.append("**Sold with:** " + ", ".join(str(x) for x in family[:8]))
+    if notes and notes not in {"-", "N/A", "n/a"}:
+        extra.append("**Notes:** " + notes[:700])
+    if extra:
+        embed.add_field(name="Additional information", value="\n".join(extra)[:1024], inline=False)
+    embed.set_footer(text="Source: WRLD group-buy API • Historical information only" + (" • Backup snapshot" if stale else ""))
+    return embed
+
+
+@bot.command(name="jwgb")
+@commands.cooldown(1, 8, commands.BucketType.user)
+async def juicewrld_group_buy(ctx: commands.Context, *, query: Optional[str] = None):
+    """Show the newest group buy, or search the group-buy archive by title."""
+    global _JWGB_LIVE_RETRY_AT
+    try:
+        # First try the public archive itself. The JSON mirror below has been
+        # observed to lag the public page by months. Back off for two minutes
+        # after each attempt so a Cloudflare 403 does not make every command slow.
+        live_items = None
+        if time.monotonic() >= _JWGB_LIVE_RETRY_AT:
+            try:
+                live_items = await _fetch_juicewrld_group_buys()
+                _JWGB_LIVE_RETRY_AT = time.monotonic() + 120
+                if live_items and len(live_items) < 3:
+                    # A partial page or changed layout isn't reliable enough to
+                    # override a more complete cached/API result.
+                    print(f"[JuiceWRLD] Live group-buy page returned only {len(live_items)} parsed item(s); checking fallback sources.")
+                    live_items = None
+            except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeError, ValueError, TypeError) as exc:
+                _JWGB_LIVE_RETRY_AT = time.monotonic() + 120
+                print(f"[JuiceWRLD] Live group-buy archive unavailable; trying JSON mirror/cache: {type(exc).__name__}: {exc}")
+
+        if live_items:
+            selected = None
+            if query and query.strip():
+                needle = _jw_normalize_match(query)
+                live_matches = [item for item in live_items if needle and (
+                    needle in _jw_normalize_match(item.get("title"))
+                    or needle in _jw_normalize_match(item.get("text"))
+                )]
+                if live_matches:
+                    selected = live_matches[0]
+            else:
+                # The archive is newest-first, but prefer an explicit parsed date
+                # when available so this remains correct if row order changes.
+                selected = max(
+                    enumerate(live_items),
+                    key=lambda pair: (_jw_groupbuy_date(pair[1]) is not None,
+                                      _jw_groupbuy_date(pair[1]) or datetime.min,
+                                      -pair[0]),
+                )[1]
+            if selected is not None:
+                title = str(selected.get("title") or "Unknown")
+                item_url = selected.get("url") or JUICEWRLD_GROUP_BUYS_URL
+                embed = discord.Embed(
+                    title=f"🧃 {'Latest ' if not query else ''}Juice WRLD Group Buy: {title}"[:256],
+                    url=item_url,
+                    description=(
+                        f"**Archive entry:** [{discord.utils.escape_markdown(title[:180])}]({item_url})\n"
+                        "Historical group-buy information only; no seller or payment links are provided."
+                    ),
+                    color=JUICE_COLOR,
+                )
+                embed.add_field(name="Goal / Price", value=str(selected.get("goal") or "Not listed")[:1024], inline=True)
+                embed.add_field(name="Outcome", value=str(selected.get("outcome") or "Not recorded")[:1024], inline=True)
+                embed.add_field(name="Date", value=str(selected.get("date") or "Not listed")[:1024], inline=True)
+                embed.set_footer(text="Source: live juicewrld.io archive • Historical information only")
+                await ctx.send(embed=embed)
+                return
+
+        try:
+            payload = await _jw_get_json_url(JUICEWRLD_GROUP_BUY_API_URL)
+            entries = _jw_gb_data(payload)
+            if entries:
+                if query and query.strip():
+                    ranked = sorted(((_jw_groupbuy_score(query, item), item) for item in entries), key=lambda pair: pair[0], reverse=True)
+                    if ranked and ranked[0][0] >= 55:
+                        await ctx.send(embed=_jw_groupbuy_embed(ranked[0][1], latest=False))
+                        return
+                    # API results can lag behind the public archive; search the saved
+                    # snapshot before reporting that a title does not exist.
+                    fallback_items = _load_juicewrld_group_buy_fallback()
+                    needle = _jw_normalize_match(query)
+                    matches = [item for item in fallback_items if needle and (
+                        needle in _jw_normalize_match(item.get("title"))
+                        or needle in _jw_normalize_match(item.get("text"))
+                    )]
+                    if matches:
+                        item = matches[0]
+                        embed = discord.Embed(
+                            title=f"🧃 Juice WRLD Group Buy: {item.get('title', 'Unknown')}"[:256],
+                            url=item.get("url") or JUICEWRLD_GROUP_BUYS_URL,
+                            description=f"**Archive entry:** [{discord.utils.escape_markdown(str(item.get('title', 'Unknown')))}]({item.get('url') or JUICEWRLD_GROUP_BUYS_URL})\nHistorical group-buy information only; no seller or payment links are provided.\n\n⚠️ This result comes from the saved archive snapshot and may not include every recent change.",
+                            color=JUICE_COLOR,
+                        )
+                        embed.add_field(name="Goal", value=str(item.get("goal") or "Not listed"), inline=True)
+                        embed.add_field(name="Outcome", value=str(item.get("outcome") or "Not recorded"), inline=True)
+                        embed.add_field(name="Date", value=str(item.get("date") or "Not listed"), inline=True)
+                        embed.set_footer(text="Source: saved juicewrld.io archive snapshot")
+                        await ctx.send(embed=embed)
+                        return
+                    await ctx.send(f"No group-buy entry matching **{discord.utils.escape_markdown(query[:100])}** was found in the API or saved snapshot.\nArchive: {JUICEWRLD_GROUP_BUYS_URL}")
+                    return
+                # The API has been lagging the public archive. Compare its newest
+                # dated row with the newest saved snapshot entry before choosing.
+                dated = [(i, _jw_groupbuy_date(item), item) for i, item in enumerate(entries)]
+                if any(date for _, date, _ in dated):
+                    dated.sort(key=lambda row: (row[1] is not None, row[1] or datetime.min, -row[0]), reverse=True)
+                    selected = dated[0][2]
+                else:
+                    selected = entries[0]
+                snapshot_items = _load_juicewrld_group_buy_fallback()
+                if snapshot_items:
+                    snapshot = snapshot_items[0]
+                    try:
+                        snapshot_date = datetime.strptime(str(snapshot.get("date", "")), "%b %d, %Y")
+                    except ValueError:
+                        snapshot_date = None
+                    api_date = _jw_groupbuy_date(selected)
+                    if snapshot_date and (api_date is None or snapshot_date > api_date):
+                        embed = discord.Embed(
+                            title=f"🧃 Latest Juice WRLD Group Buy: {snapshot.get('title', 'Unknown')}"[:256],
+                            url=snapshot.get("url") or JUICEWRLD_GROUP_BUYS_URL,
+                            description=f"**Archive entry:** [{discord.utils.escape_markdown(str(snapshot.get('title', 'Unknown')))}]({snapshot.get('url') or JUICEWRLD_GROUP_BUYS_URL})\nHistorical group-buy information only; no seller or payment links are provided.\n\n⚠️ The live API appears to be behind; this is the newest entry in the saved snapshot.",
+                            color=JUICE_COLOR,
+                        )
+                        embed.add_field(name="Goal", value=str(snapshot.get("goal") or "Not listed"), inline=True)
+                        embed.add_field(name="Outcome", value=str(snapshot.get("outcome") or "Not recorded"), inline=True)
+                        embed.add_field(name="Date", value=str(snapshot.get("date") or "Not listed"), inline=True)
+                        embed.set_footer(text="Source: saved juicewrld.io archive snapshot")
+                        await ctx.send(embed=embed)
+                        return
+                await ctx.send(embed=_jw_groupbuy_embed(selected, latest=True))
+                return
+            print("[JuiceWRLD] Group-buy API returned no entries; trying the existing archive fallback.")
+        except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeError, ValueError, TypeError) as exc:
+            print(f"[JuiceWRLD] WRLD group-buy API failed; trying existing fallback: {type(exc).__name__}: {exc}")
+
+        # The hosting runtime has already confirmed that juicewrld.io challenges its
+        # direct requests (HTTP 403). Avoid repeating a slow blocked request on every
+        # command; serve the saved snapshot/bootstrap if the separate WRLD API fails.
+        items = _load_juicewrld_group_buy_fallback()
+        fallback_used = True
+        if not items:
+            return await ctx.send("I couldn't load group-buy data from either source right now. Please try again later.")
+        if query and query.strip():
+            needle = query.strip().casefold()
+            matches = [item for item in items if needle in str(item.get("title", "")).casefold() or needle in str(item.get("text", "")).casefold()]
+            if not matches:
+                status = "The live sources are unavailable and the saved fallback may be incomplete." if fallback_used else "No matching entry was found."
+                return await ctx.send(f"{status} Search the archive directly: {JUICEWRLD_GROUP_BUYS_URL}")
+            item = matches[0]
+        else:
+            item = items[0]
+        embed = discord.Embed(
+            title=f"🧃 {'Latest ' if not query else ''}Juice WRLD Group Buy: {item.get('title', 'Unknown')}"[:256],
+            url=item.get("url") or JUICEWRLD_GROUP_BUYS_URL,
+            description=(f"**Archive entry:** [{discord.utils.escape_markdown(str(item.get('title', 'Unknown')))}]({item.get('url') or JUICEWRLD_GROUP_BUYS_URL})\nHistorical archive information only; no seller or payment links are provided."
+                        + ("\n\n⚠️ **Backup data:** the live sources are unavailable, so this may be outdated." if fallback_used else "")),
+            color=JUICE_COLOR,
+        )
+        embed.add_field(name="Goal", value=str(item.get("goal") or "Not listed"), inline=True)
+        embed.add_field(name="Outcome", value=str(item.get("outcome") or "Not recorded"), inline=True)
+        embed.add_field(name="Date", value=str(item.get("date") or "Not listed"), inline=True)
+        embed.set_footer(text="Source: juicewrld.io/groupbuys" + (" • Backup snapshot; not live" if fallback_used else ""))
+        await ctx.send(embed=embed)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        print(f"[Voice] Auto-leave failed: {type(exc).__name__}: {exc}", flush=True)
-    finally:
-        if _voice_idle_tasks.get(guild_id) is asyncio.current_task():
-            _voice_idle_tasks.pop(guild_id, None)
+        print(f"[JuiceWRLD] Unexpected group-buy lookup error: {type(exc).__name__}: {exc!r}")
+        await ctx.send("I couldn't load the group-buy entry right now. Please try again later.")
 
 
-@bot.listen("on_voice_state_update")
-async def _voice_idle_watch(member, before, after):
-    if VOICE_IDLE_LEAVE_SECONDS <= 0:
-        return
-    guild = member.guild
-    voice = guild.voice_client
-    if not voice or not voice.channel:
-        return
-    task = _voice_idle_tasks.get(guild.id)
-    if _humans_in_channel(voice.channel) > 0:
-        if task and not task.done():
-            task.cancel()
-        _voice_idle_tasks.pop(guild.id, None)
-        return
-    if task is None or task.done():
-        _voice_idle_tasks[guild.id] = asyncio.create_task(_leave_when_empty(guild.id))
+# Adapted for VaultBot from the structure/features of purrre/WRLD-bot.
+# Source data remains owned by its respective providers; only public read endpoints are used.
+_JW_SONGS_CACHE = []
+_JW_SONGS_CACHE_AT = 0.0
+_JW_SONGS_CACHE_TTL = 1800
 
 
-# Juice WRLD-specific commands and integrations were removed.
+def _jw_song_name(song: dict) -> str:
+    titles = song.get("track_titles") or []
+    if isinstance(titles, str):
+        titles = [titles]
+    return str((titles[0] if titles else None) or song.get("name") or song.get("title") or "Unknown song")
+
+
+def _jw_lyrics_text(song: dict) -> str:
+    value = song.get("lyrics")
+    if isinstance(value, dict):
+        value = value.get("lyrics") or value.get("text")
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    return "" if value.casefold() in {"", "none", "null", "n/a", "not available"} else value
+
+
+async def _jw_search_songs(query: str, limit: int = 25):
+    payload = await _juicewrld_api_get("/songs/", params={"search": query, "page_size": limit, "versions": "true"})
+    songs = [item for item in _juicewrld_items(payload) if isinstance(item, dict) and (item.get("id") is not None or item.get("public_id") is not None)]
+    songs.sort(key=lambda item: _jw_song_score(item, query), reverse=True)
+    return songs[:limit]
+
+
+async def _jw_get_song_detail(song: dict) -> dict:
+    song_id = song.get("id")
+    if song_id is None:
+        return song
+    payload = await _juicewrld_api_get(f"/songs/{int(song_id)}/")
+    if isinstance(payload, dict):
+        combined = dict(song)
+        combined.update(payload)
+        return combined
+    return song
+
+
+async def _jw_fetch_song_catalog():
+    """Load a paginated catalog for lyrics search; keep it in memory for 30 minutes."""
+    global _JW_SONGS_CACHE, _JW_SONGS_CACHE_AT
+    now = time.monotonic()
+    if _JW_SONGS_CACHE and now - _JW_SONGS_CACHE_AT < _JW_SONGS_CACHE_TTL:
+        return _JW_SONGS_CACHE
+    catalog, seen = [], set()
+    for page in range(1, 81):
+        payload = await _juicewrld_api_get("/songs/", params={"page": page, "page_size": 100, "versions": "true"})
+        items = _juicewrld_items(payload)
+        if not items:
+            break
+        before = len(seen)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("id") or item.get("public_id") or item.get("name") or "")
+            if key and key not in seen:
+                seen.add(key)
+                catalog.append(item)
+        if isinstance(payload, dict) and "next" in payload:
+            if not payload.get("next"):
+                break
+        elif len(items) < 100:
+            break
+        if len(seen) == before:
+            break
+    if catalog:
+        _JW_SONGS_CACHE = catalog
+        _JW_SONGS_CACHE_AT = now
+    return _JW_SONGS_CACHE
+
+
+async def _jw_send_lyrics(ctx, song: dict):
+    lyrics = _jw_lyrics_text(song)
+    if not lyrics:
+        return await ctx.send(f"No lyrics are available for **{discord.utils.escape_markdown(_jw_song_name(song))}** in the catalog.")
+    # Respect Discord embed limits by splitting into manageable pages.
+    chunks, current = [], ""
+    for line in lyrics.splitlines() or [lyrics]:
+        if len(current) + len(line) + 1 > 3800 and current:
+            chunks.append(current.rstrip())
+            current = ""
+        current += line + "\n"
+    if current.strip():
+        chunks.append(current.rstrip())
+    title = _jw_song_name(song)[:180]
+    max_parts = min(len(chunks), 8)
+    for i, chunk in enumerate(chunks[:max_parts], start=1):
+        page_title = f"Lyrics — {title}" if len(chunks) == 1 else f"Lyrics — {title} ({i}/{len(chunks)})"
+        embed = discord.Embed(title=page_title[:256], description=chunk[:4000], color=JUICE_COLOR)
+        embed.set_footer(text="Source: JuiceWRLDAPI • Lyrics and metadata are provider-supplied")
+        await ctx.send(embed=embed)
+    if len(chunks) > max_parts:
+        await ctx.send(f"Lyrics were shortened because the entry is unusually long ({len(chunks)} parts total).")
+
+
+@bot.command(name="jwlyric")
+@commands.cooldown(1, 8, commands.BucketType.user)
+async def juicewrld_lyrics(ctx: commands.Context, *, query: str):
+    """Find a song by title and display its available lyrics."""
+    try:
+        songs = await _jw_search_songs(query)
+        if not songs:
+            return await ctx.send(f"No Juice WRLD catalog entries found for **{discord.utils.escape_markdown(query[:100])}**.")
+        # Check the highest-ranked matches in case search results omit lyrics until detail is fetched.
+        for candidate in songs[:5]:
+            song = await _jw_get_song_detail(candidate)
+            if _jw_lyrics_text(song):
+                return await _jw_send_lyrics(ctx, song)
+        return await ctx.send(f"I found **{discord.utils.escape_markdown(_jw_song_name(songs[0]))}**, but the API did not return lyrics for that entry.")
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+        print(f"[JuiceWRLD] Lyrics lookup failed: {type(exc).__name__}: {exc}")
+        await ctx.send("The Juice WRLD lyric service is unavailable right now. Please try again later.")
+
+
+@bot.command(name="jwlyricsearch")
+@commands.cooldown(1, 12, commands.BucketType.user)
+async def juicewrld_lyrics_search(ctx: commands.Context, *, phrase: str):
+    """Search catalog lyrics for a phrase and list likely matching songs."""
+    query_norm = _jw_normalize_match(phrase)
+    if len(query_norm) < 5:
+        return await ctx.send(f"Give me a longer lyric phrase. Example: `{PREFIX}jwlyricsearch wishing well`.")
+    try:
+        await ctx.typing()
+        songs = await _jw_fetch_song_catalog()
+        if not songs:
+            return await ctx.send("The Juice WRLD catalog could not be loaded, so lyric search is unavailable right now.")
+        matches = []
+        q_words = {w for w in re.findall(r"[a-z0-9]+", phrase.casefold()) if len(w) > 2}
+        for song in songs:
+            lyrics = _jw_lyrics_text(song)
+            if not lyrics:
+                continue
+            norm_lyrics = _jw_normalize_match(lyrics)
+            score, matched_line = 0, ""
+            if query_norm in norm_lyrics:
+                score = 100
+                for line in lyrics.splitlines():
+                    if query_norm in _jw_normalize_match(line):
+                        matched_line = line.strip()
+                        break
+            else:
+                best_ratio = 0.0
+                for line in lyrics.splitlines():
+                    clean = line.strip()
+                    if not clean or len(clean) < max(5, len(phrase) // 2) or len(clean) > len(phrase) * 3:
+                        continue
+                    line_norm = _jw_normalize_match(clean)
+                    ratio = difflib.SequenceMatcher(None, query_norm, line_norm).ratio()
+                    if q_words and q_words.issubset(set(re.findall(r"[a-z0-9]+", clean.casefold()))):
+                        ratio = max(ratio, 0.84)
+                    if ratio > best_ratio:
+                        best_ratio, matched_line = ratio, clean
+                if best_ratio >= 0.84:
+                    score = round(best_ratio * 100)
+            if score:
+                matches.append((score, song, matched_line))
+        matches.sort(key=lambda item: item[0], reverse=True)
+        # Exact phrase hits first and keep the output readable.
+        seen_titles, results = set(), []
+        for score, song, line in matches:
+            title = _jw_song_name(song)
+            key = _jw_normalize_match(title)
+            if not key or key in seen_titles:
+                continue
+            seen_titles.add(key)
+            results.append((score, title, line))
+            if len(results) >= 10:
+                break
+        if not results:
+            return await ctx.send(f"No lyric matches found for **{discord.utils.escape_markdown(phrase[:120])}**. Try a longer or more exact phrase.")
+        embed = discord.Embed(
+            title="🔎 Juice WRLD Lyric Search",
+            description=f"Found **{len(results)}** matching song(s) for: “{discord.utils.escape_markdown(phrase[:180])}”",
+            color=JUICE_COLOR,
+        )
+        for i, (score, title, line) in enumerate(results, start=1):
+            snippet = discord.utils.escape_markdown((line or "Matching lyric text")[:180])
+            embed.add_field(name=f"{i}. {title[:240]}", value=f"{snippet}\n-# Match score: {score}%", inline=False)
+        embed.set_footer(text="Search covers the catalog returned by JuiceWRLDAPI; results depend on available lyric metadata.")
+        await ctx.send(embed=embed)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+        print(f"[JuiceWRLD] Lyric search failed: {type(exc).__name__}: {exc}")
+        await ctx.send("The Juice WRLD catalog is unavailable right now. Please try lyric search again later.")
+
+
+@bot.command(name="jwcover")
+@commands.cooldown(1, 8, commands.BucketType.user)
+async def juicewrld_cover(ctx: commands.Context, *, query: str):
+    """Search community cover art and display every result directly in Discord."""
+    try:
+        payload = await _jw_get_json_url("https://wrld.pure0.lol/api/covers/", params={"search": query})
+        images = payload.get("images", []) if isinstance(payload, dict) else []
+        urls, seen = [], set()
+        for image in images if isinstance(images, list) else []:
+            if isinstance(image, dict):
+                image = image.get("url") or image.get("image") or image.get("src")
+            if not isinstance(image, str) or not image.strip():
+                continue
+            image = image.strip().replace(" ", "%20")
+            if image.startswith("/"):
+                image = "https://wrld.pure0.lol" + image
+            if not image.startswith(("https://", "http://")):
+                continue
+            if image.lower() not in seen:
+                urls.append(image)
+                seen.add(image.lower())
+            if len(urls) >= 19:
+                break
+        if not urls:
+            return await ctx.send(f"No cover art found for **{discord.utils.escape_markdown(query[:100])}**. The cover service may also be unavailable.")
+
+        # Discord allows up to 10 embeds per message. Give each cover its own image
+        # embed, so users can see the results in chat rather than opening each link.
+        await ctx.send(f"🎨 Found **{len(urls)}** cover image(s) for **{discord.utils.escape_markdown(query[:100])}**:")
+        for offset in range(0, len(urls), 10):
+            embeds = []
+            for index, url in enumerate(urls[offset:offset + 10], start=offset + 1):
+                embed = discord.Embed(title=f"Cover art: {query[:150]} · {index}/{len(urls)}", color=JUICE_COLOR)
+                embed.set_image(url=url)
+                embeds.append(embed)
+            await ctx.send(embeds=embeds)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+        print(f"[JuiceWRLD] Cover lookup failed: {type(exc).__name__}: {exc}")
+        await ctx.send("The cover-art service is unavailable right now. Please try again later.")
+
+
+@bot.command(name="jwfiles")
+@commands.cooldown(1, 10, commands.BucketType.user)
+async def juicewrld_files(ctx: commands.Context, *, query: str):
+    """Search JuiceWRLDAPI's file browser for audio files matching a song title."""
+    try:
+        await ctx.typing()
+        payload = await _juicewrld_api_get("/files/browse/", params={"search": query})
+        items = _juicewrld_items(payload)
+        files = _jw_audio_candidates(items, query)
+        if not files:
+            # Some API deployments have a browse endpoint that returns directory summaries;
+            # fall back to the flat listing but keep the same title/path filtering.
+            payload = await _juicewrld_api_get("/files/list-all/")
+            items = _juicewrld_items(payload)
+            files = _jw_audio_candidates(items, query)
+        if not files:
+            return await ctx.send(f"No matching audio files found for **{discord.utils.escape_markdown(query[:120])}**. A catalog entry does not guarantee an audio file is available.")
+        view = discord.ui.View(timeout=180)
+        view.add_item(JuiceWRLDFileSelect(files, ctx.author.id, query[:200]))
+        embed = discord.Embed(
+            title="📁 Juice WRLD File Search",
+            description=f"Found **{len(files)}** audio file(s) matching **{discord.utils.escape_markdown(query[:150])}**. Choose a file below to open download links.",
+            color=JUICE_COLOR,
+        )
+        embed.set_footer(text="Source: JuiceWRLDAPI file browser • Availability depends on the API listing")
+        await ctx.send(embed=embed, view=view)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+        print(f"[JuiceWRLD] File search failed: {type(exc).__name__}: {exc}")
+        await ctx.send("The Juice WRLD file browser is unavailable right now. Please try again later.")
+
+
+@bot.command(name="jwsong", aliases=["jwsearch", "jwmusicsearch"])
+async def juicewrld_song_search(ctx: commands.Context, *, query: str):
+    """Search the Juice WRLD catalog and browse full song details."""
+    try:
+        payload = await _juicewrld_api_get(
+            "/songs/",
+            params={"search": query, "page_size": 25, "versions": "true"}
+        )
+        songs = [song for song in _juicewrld_items(payload)
+                 if isinstance(song, dict) and song.get("id") is not None]
+        if not songs:
+            await ctx.send(
+                f"No Juice WRLD catalog results found for **{query[:100]}**."
+            )
+            return
+
+        # Put the closest title/alternate-title match first, then keep the API's
+        # order for equally relevant results. The dropdown can show up to 25.
+        songs = sorted(songs, key=lambda song: _jw_song_score(song, query), reverse=True)
+        first = songs[0]
+        try:
+            detail = await _juicewrld_api_get(f"/songs/{int(first['id'])}/")
+            if isinstance(detail, dict) and detail.get("id") is not None:
+                merged = dict(first)
+                merged.update(detail)
+                first = merged
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+            print(f"[JuiceWRLD] Initial detail lookup failed: {exc}")
+
+        view = JuiceWRLDSongView(songs, ctx.author.id, first)
+        embed = _build_juicewrld_song_embed(first, query)
+        if len(songs) > 1:
+            embed.add_field(
+                name="Related results",
+                value=(f"Found **{len(songs)}** matching or related catalog entries. "
+                       "Use the dropdown below to open another song or version."),
+                inline=False
+            )
+        message = await ctx.send(embed=embed, view=view)
+        view.message = message
+
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+        print(f"[JuiceWRLD] Song search failed: {exc}")
+        await ctx.send("The Juice WRLD API is unavailable right now. Try again later.")
+
 
 # =============================================================================
 # 12. SLASH COMMANDS
@@ -2584,7 +3424,7 @@ async def ping(interaction: discord.Interaction):
 # SERVER MEMBER STAT CHANNELS
 # =============================================================================
 MEMBER_STATS_CATEGORY = "📊 SERVER STATS"
-MEMBER_STATS_REFRESH_MINUTES = 60
+MEMBER_STATS_REFRESH_MINUTES = 5
 
 
 def _member_stats_counts(guild: discord.Guild) -> tuple[int, int, int]:
@@ -3806,14 +4646,14 @@ How it works
 * /patchnotes add      follows a Steam game (Steam's public news feed, no key).
 * /patchnotes addfeed  follows Minecraft (Java/Bedrock), NVIDIA GeForce drivers
                        or Fortnite updates.
-* The low-traffic default checks each followed source every two hours and posts
-  any new item to the subscribed channel as an embed.
+* Every few minutes the bot checks each followed source and posts anything it
+  hasn't posted before to the subscribed channel as an embed.
 
 This file is self-contained. VaultBot.py loads it inside a try/except, so if
 anything in here ever fails, the rest of the bot keeps running.
 
 Optional environment variables (all have sensible defaults):
-  PATCHNOTES_POLL_MINUTES   how often to check Steam (default 120, minimum 60)
+  PATCHNOTES_POLL_MINUTES   how often to check Steam (default 10)
   PATCHNOTES_DATA_FILE      where subscriptions are saved
                             (default: patchnotes_data.json next to this file)
   ANTHROPIC_API_KEY         optional: lets an AI model write the "key updates" summary
@@ -3854,12 +4694,10 @@ EMBED_COLOR = discord.Color.from_rgb(0, 225, 255)  # VaultBot neon-cyan sci-fi a
 
 def _poll_minutes() -> int:
     try:
-        # Two-hour default; keep at least hourly even if a previous environment
-        # setting still says 20 minutes.
-        return max(60, int(os.getenv("PATCHNOTES_POLL_MINUTES", "120")))
+        return max(2, int(os.getenv("PATCHNOTES_POLL_MINUTES", "10")))
     except (TypeError, ValueError):
-        print("[PatchNotes] PATCHNOTES_POLL_MINUTES must be a number; using 120.")
-        return 120
+        print("[PatchNotes] PATCHNOTES_POLL_MINUTES must be a number; using 10.")
+        return 10
 
 
 POLL_MINUTES = _poll_minutes()
@@ -4754,119 +5592,6 @@ async def _fetch_fortnite() -> list:
     return items
 
 
-_HYPEX_IMG_CACHE: dict = {}
-
-
-def _hypex_image_ok(url: str) -> bool:
-    """True if a URL looks like a real post image (not an avatar, emoji, or video file)."""
-    low = url.lower()
-    parsed = urlparse(url)
-    host, path = parsed.netloc.lower(), parsed.path.lower()
-    if "profile_images" in path or "/emoji/" in path or "abs.twimg.com/emoji" in low:
-        return False
-    # X/Twitter media URLs often have NO file extension: pbs.twimg.com/media/ID?format=jpg&name=large
-    if host.endswith("twimg.com") and any(
-        part in path for part in ("/media/", "/ext_tw_video_thumb/", "/amplify_video_thumb/",
-                                  "/tweet_video_thumb/", "/card_img/")
-    ):
-        return True
-    if path.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
-        return True
-    return bool(re.search(r"[?&]format=(jpg|jpeg|png|webp|gif)\b", low))
-
-
-def _hypex_normalize_image(url, strict: bool = True) -> Optional[str]:
-    if not isinstance(url, str):
-        return None
-    url = html.unescape(url.strip())
-    if url.startswith("//"):
-        url = "https:" + url
-    elif url.startswith("http://"):
-        url = "https://" + url[len("http://"):]
-    if not url.startswith("https://"):
-        return None
-    if strict and not _hypex_image_ok(url):
-        return None
-    return url
-
-
-def _hypex_pick_image(entry, description_html: str) -> Optional[str]:
-    """Find the post's picture: feed media tags first, then <img>/<video poster> inside the post HTML."""
-    candidates = []
-    for node in entry.iter():
-        tag = node.tag if isinstance(node.tag, str) else ""
-        attrs = node.attrib
-        if tag.endswith(("}content", "}thumbnail")) or tag in ("content", "thumbnail", "enclosure"):
-            if attrs.get("url"):
-                candidates.append(attrs["url"])
-        if (tag.endswith("}link") or tag == "link") and attrs.get("rel") == "enclosure" and attrs.get("href"):
-            candidates.append(attrs["href"])
-    # The feed usually embeds the picture as <img src="..."> inside the description HTML,
-    # which html_to_text() strips out, so look for it BEFORE converting to plain text.
-    for match in re.finditer(r"""(?is)<(?:img|source|video)\b[^>]*?\b(?:src|poster)\s*=\s*["']([^"']+)["']""",
-                             description_html or ""):
-        candidates.append(match.group(1))
-    for candidate in candidates:
-        normalized = _hypex_normalize_image(candidate)
-        if normalized:
-            return normalized
-    return None
-
-
-def _hypex_image_from_api(data) -> Optional[str]:
-    """Pull a photo (or video thumbnail) from an FxTwitter API JSON response."""
-    tweet = data.get("tweet") if isinstance(data, dict) else None
-    if not isinstance(tweet, dict):
-        return None
-    for holder in (tweet, tweet.get("quote")):
-        media = holder.get("media") if isinstance(holder, dict) else None
-        if not isinstance(media, dict):
-            continue
-        for photo in media.get("photos") or []:
-            found = _hypex_normalize_image(photo.get("url") if isinstance(photo, dict) else None, strict=False)
-            if found:
-                return found
-        for video in media.get("videos") or []:
-            found = _hypex_normalize_image(video.get("thumbnail_url") if isinstance(video, dict) else None, strict=False)
-            if found:
-                return found
-    return None
-
-
-async def _hypex_fill_missing_images(items: list) -> None:
-    """Fallback: ask the FxTwitter API for the picture of any post whose feed entry had none."""
-    missing = [item for item in items if not item.get("image")]
-    if not missing:
-        return
-    timeout = aiohttp.ClientTimeout(total=12)
-    headers = {"Accept": "application/json", "User-Agent": "VaultBot/1.0 (+Discord Fortnite update feed)"}
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        for item in missing:
-            match = re.search(r"(?:x|twitter|fxtwitter|fixupx)\.com/([^/]+)/status/(\d+)",
-                              str(item.get("url") or ""), flags=re.IGNORECASE)
-            if not match:
-                continue
-            user, status_id = match.groups()
-            if status_id in _HYPEX_IMG_CACHE:
-                item["image"] = _HYPEX_IMG_CACHE[status_id] or None
-                continue
-            image = None
-            try:
-                async with session.get(f"https://api.fxtwitter.com/{user}/status/{status_id}") as resp:
-                    if resp.status == 200:
-                        image = _hypex_image_from_api(await resp.json(content_type=None))
-                    elif resp.status != 404:
-                        print(f"[PatchNotes] HYPEX image lookup HTTP {resp.status} for {status_id}", flush=True)
-                        continue  # transient problem: don't cache, retry next poll
-            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
-                print(f"[PatchNotes] HYPEX image lookup failed for {status_id}: {type(exc).__name__}: {exc}", flush=True)
-                continue
-            _HYPEX_IMG_CACHE[status_id] = image or ""
-            while len(_HYPEX_IMG_CACHE) > 500:
-                _HYPEX_IMG_CACHE.pop(next(iter(_HYPEX_IMG_CACHE)))
-            item["image"] = image
-
-
 async def _fetch_hypex() -> list:
     """Read recent HYPEX posts through public FxEmbed RSS/Atom feed endpoints.
 
@@ -4931,7 +5656,6 @@ async def _fetch_hypex() -> list:
         guid = child_text(["guid", "id", "{http://www.w3.org/2005/Atom}id"]) or link or title
         description = child_text(["description", "{http://www.w3.org/2005/Atom}content", "{http://www.w3.org/2005/Atom}summary"])
         description = html.unescape(description)
-        description_html = description
         description = html_to_text(description, 3000)
         date_text = child_text(["pubDate", "published", "updated", "{http://www.w3.org/2005/Atom}published", "{http://www.w3.org/2005/Atom}updated"])
         try:
@@ -4939,7 +5663,13 @@ async def _fetch_hypex() -> list:
         except (TypeError, ValueError, OverflowError):
             date_value = _parse_date(date_text)
 
-        image = _hypex_pick_image(entry, description_html)
+        image = None
+        for node in entry.iter():
+            if node.tag.endswith("}content") or node.tag.endswith("}thumbnail") or node.tag == "enclosure":
+                candidate = node.attrib.get("url")
+                if candidate and candidate.startswith("https://") and any(ext in candidate.lower() for ext in (".jpg", ".jpeg", ".png", ".webp")):
+                    image = candidate
+                    break
         if not link.startswith(("https://", "http://")):
             link = "https://x.com/HYPEX"
         if not description:
@@ -4958,12 +5688,7 @@ async def _fetch_hypex() -> list:
             "source": "HYPEX // UNOFFICIAL SOURCE",
         })
     items.sort(key=lambda item: int(item.get("date") or 0), reverse=True)
-    items = items[:8]
-    try:
-        await _hypex_fill_missing_images(items)
-    except Exception as exc:  # a picture lookup must never block an alert
-        print(f"[PatchNotes] HYPEX image fallback failed: {type(exc).__name__}: {exc}", flush=True)
-    return items
+    return items[:8]
 
 
 FEEDS = {
@@ -5310,7 +6035,7 @@ Setup
 3. /drops status shows when the feed was last read and whether it's failing.
 
 Optional environment variables
-  DROPS_POLL_MINUTES   how often to read the feed (default 120, minimum 60)
+  DROPS_POLL_MINUTES   how often to read the feed (default 15, minimum 5)
   DROPS_DATA_FILE      where settings are saved (default: drops_data.json next to this file)
 
 Notes
@@ -5324,7 +6049,7 @@ Notes
 """
 
 DROPS_FEED_URL = os.getenv("DROPS_FEED_URL", "").strip()
-DROPS_POLL_MINUTES = max(60, _positive_int_env("DROPS_POLL_MINUTES", 120))
+DROPS_POLL_MINUTES = max(5, _positive_int_env("DROPS_POLL_MINUTES", 15))
 DROPS_DATA_FILE = Path(os.getenv(
     "DROPS_DATA_FILE",
     str(Path(__file__).resolve().parent / "drops_data.json"),
@@ -5334,7 +6059,7 @@ DROPS_MAX_POSTS_PER_POLL = 10   # cap a burst of new entries
 DROPS_MAX_GAMES_PER_SERVER = 50
 DROPS_SEEN_LIMIT = 1000         # how many entry IDs to remember
 DROPS_FAIL_ALERT_AFTER = 6      # consecutive failures before the owner is DM'd
-DROPS_MAX_FEED_BYTES = 500_000
+DROPS_MAX_FEED_BYTES = 2_000_000
 DROPS_COLOR = discord.Color.from_rgb(145, 70, 255)
 _DROPS_ALL = "all"
 
@@ -5847,6 +6572,635 @@ _install_drops()
 
 
 # =============================================================================
+# 12e. XP, LEVELS, ACHIEVEMENTS & INTERACTIVE LEADERBOARDS
+# =============================================================================
+# Additive module: uses SQLite and the existing discord.py bot/tree.
+import sqlite3
+from datetime import datetime, timezone, timedelta
+
+XP_DB_PATH = Path(os.getenv("VAULTBOT_XP_DB", str(Path(__file__).with_name("vaultbot_xp.sqlite3"))))
+XP_DEFAULTS = {
+    "enabled": 1,
+    "xp_min": 15,
+    "xp_max": 25,
+    "cooldown": 60,
+    "levelup_enabled": 1,
+    "levelup_channel_id": 0,
+    "ignored_channels": "",
+    "ignored_roles": "",
+    "voice_enabled": 0,
+    "announcement_text": "✨ {member} reached **Level {level}**!",
+}
+XP_COLOR = discord.Color.from_rgb(112, 78, 190)
+XP_ACHIEVEMENTS = {
+    "first_message": {"name": "First Steps", "description": "Send your first eligible message.", "icon": "👋", "kind": "messages", "target": 1, "rarity": "Common"},
+    "chatterbox": {"name": "Chatterbox", "description": "Send 100 eligible messages.", "icon": "💬", "kind": "messages", "target": 100, "rarity": "Common"},
+    "social_regular": {"name": "Social Regular", "description": "Be active on 7 different days.", "icon": "📅", "kind": "days", "target": 7, "rarity": "Uncommon"},
+    "rising_star": {"name": "Rising Star", "description": "Reach level 10.", "icon": "🌟", "kind": "level", "target": 10, "rarity": "Uncommon"},
+    "dedicated": {"name": "Dedicated", "description": "Reach level 25.", "icon": "💎", "kind": "level", "target": 25, "rarity": "Rare"},
+    "veteran": {"name": "Veteran", "description": "Reach level 50.", "icon": "🏆", "kind": "level", "target": 50, "rarity": "Epic"},
+    "legend": {"name": "Legend", "description": "Reach level 100.", "icon": "👑", "kind": "level", "target": 100, "rarity": "Legendary"},
+    "collector": {"name": "Collector", "description": "Unlock 10 achievements.", "icon": "🗃️", "kind": "achievements", "target": 10, "rarity": "Rare"},
+}
+_xp_last_award: dict[tuple[int, int], float] = {}
+_xp_voice_awarded: dict[tuple[int, int], float] = {}
+
+
+def _xp_connect():
+    XP_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(XP_DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def _xp_init_db():
+    with _xp_connect() as db:
+        db.executescript("""
+        CREATE TABLE IF NOT EXISTS xp_profiles (
+            guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+            total_xp INTEGER NOT NULL DEFAULT 0, messages INTEGER NOT NULL DEFAULT 0,
+            active_days INTEGER NOT NULL DEFAULT 0, last_active_day TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (guild_id, user_id));
+        CREATE TABLE IF NOT EXISTS xp_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL, amount INTEGER NOT NULL, created_at TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS xp_events_guild_date ON xp_events(guild_id, created_at);
+        CREATE TABLE IF NOT EXISTS xp_achievements (
+            guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, achievement_key TEXT NOT NULL,
+            unlocked_at TEXT NOT NULL, PRIMARY KEY (guild_id, user_id, achievement_key));
+        CREATE TABLE IF NOT EXISTS xp_settings (
+            guild_id INTEGER PRIMARY KEY, settings_json TEXT NOT NULL DEFAULT '{}');
+        CREATE TABLE IF NOT EXISTS xp_level_rewards (
+            guild_id INTEGER NOT NULL, level INTEGER NOT NULL, role_id INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, level));
+        CREATE TABLE IF NOT EXISTS profile_presence (
+            guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+            joins INTEGER NOT NULL DEFAULT 0, leaves INTEGER NOT NULL DEFAULT 0,
+            first_recorded_join TEXT, last_joined TEXT,
+            PRIMARY KEY (guild_id, user_id));
+        """)
+
+
+def _xp_settings(guild_id: int) -> dict:
+    with _xp_connect() as db:
+        row = db.execute("SELECT settings_json FROM xp_settings WHERE guild_id=?", (guild_id,)).fetchone()
+    settings = dict(XP_DEFAULTS)
+    if row:
+        try:
+            settings.update(json.loads(row["settings_json"]))
+        except (ValueError, TypeError):
+            pass
+    return settings
+
+
+def _xp_save_settings(guild_id: int, settings: dict) -> None:
+    with _xp_connect() as db:
+        db.execute("INSERT INTO xp_settings(guild_id,settings_json) VALUES(?,?) ON CONFLICT(guild_id) DO UPDATE SET settings_json=excluded.settings_json",
+                   (guild_id, json.dumps(settings)))
+
+
+def _xp_level(total_xp: int) -> int:
+    # Level N requires 100*N*(N+1)/2 total XP; level 1 begins at 100 XP.
+    level = 0
+    while total_xp >= 100 * (level + 1) * (level + 2) // 2:
+        level += 1
+    return level
+
+
+def _xp_level_progress(total_xp: int) -> tuple[int, int, int]:
+    level = _xp_level(total_xp)
+    current_floor = 100 * level * (level + 1) // 2
+    next_floor = 100 * (level + 1) * (level + 2) // 2
+    return level, total_xp - current_floor, max(1, next_floor - current_floor)
+
+
+def _xp_unlock(db, guild_id: int, user_id: int, key: str) -> bool:
+    if key not in XP_ACHIEVEMENTS:
+        return False
+    cur = db.execute("INSERT OR IGNORE INTO xp_achievements(guild_id,user_id,achievement_key,unlocked_at) VALUES(?,?,?,?)",
+                      (guild_id, user_id, key, datetime.now(timezone.utc).isoformat()))
+    return cur.rowcount > 0
+
+
+def _xp_check_achievements(db, guild_id: int, user_id: int, total_xp: int, messages: int, active_days: int) -> list[str]:
+    level = _xp_level(total_xp)
+    earned = []
+    for key, item in XP_ACHIEVEMENTS.items():
+        value = {"messages": messages, "days": active_days, "level": level}.get(item["kind"], 0)
+        if item["kind"] == "achievements":
+            value = db.execute("SELECT COUNT(*) FROM xp_achievements WHERE guild_id=? AND user_id=?", (guild_id, user_id)).fetchone()[0]
+        if value >= item["target"] and _xp_unlock(db, guild_id, user_id, key):
+            earned.append(key)
+    return earned
+
+
+async def _xp_process_message(message: discord.Message):
+    if not message.guild or message.author.bot or message.webhook_id or message.author.system:
+        return
+    if message.content.startswith(PREFIX):
+        return
+    guild_id, user_id = message.guild.id, message.author.id
+    settings = _xp_settings(guild_id)
+    if not settings.get("enabled", 1):
+        return
+    try:
+        ignored_channels = {int(x) for x in str(settings.get("ignored_channels", "")).split(",") if x.strip()}
+        ignored_roles = {int(x) for x in str(settings.get("ignored_roles", "")).split(",") if x.strip()}
+    except ValueError:
+        ignored_channels, ignored_roles = set(), set()
+    if message.channel.id in ignored_channels or any(r.id in ignored_roles for r in getattr(message.author, "roles", [])):
+        return
+    now = time.time()
+    cooldown_key = (guild_id, user_id)
+    if now - _xp_last_award.get(cooldown_key, 0) < max(1, int(settings.get("cooldown", 60))):
+        # Count message statistics only for eligible chat, not every rapid message.
+        return
+    _xp_last_award[cooldown_key] = now
+    amount = random.randint(max(0, int(settings.get("xp_min", 15))), max(0, int(settings.get("xp_max", 25))))
+    today = datetime.now(timezone.utc).date().isoformat()
+    unlocked = []
+    with _xp_connect() as db:
+        row = db.execute("SELECT * FROM xp_profiles WHERE guild_id=? AND user_id=?", (guild_id, user_id)).fetchone()
+        old_xp = int(row["total_xp"]) if row else 0
+        old_level = _xp_level(old_xp)
+        old_messages = int(row["messages"]) if row else 0
+        old_days = int(row["active_days"]) if row else 0
+        last_day = row["last_active_day"] if row else ""
+        new_days = old_days + (1 if last_day != today else 0)
+        new_xp = old_xp + amount
+        new_messages = old_messages + 1
+        db.execute("INSERT INTO xp_profiles(guild_id,user_id,total_xp,messages,active_days,last_active_day) VALUES(?,?,?,?,?,?) ON CONFLICT(guild_id,user_id) DO UPDATE SET total_xp=excluded.total_xp,messages=excluded.messages,active_days=excluded.active_days,last_active_day=excluded.last_active_day",
+                   (guild_id, user_id, new_xp, new_messages, new_days, today))
+        db.execute("INSERT INTO xp_events(guild_id,user_id,amount,created_at) VALUES(?,?,?,?)",
+                   (guild_id, user_id, amount, datetime.now(timezone.utc).isoformat()))
+        unlocked = _xp_check_achievements(db, guild_id, user_id, new_xp, new_messages, new_days)
+        new_level = _xp_level(new_xp)
+        reward_rows = db.execute("SELECT level,role_id FROM xp_level_rewards WHERE guild_id=? AND level<=?", (guild_id, new_level)).fetchall() if new_level > old_level else []
+    if new_level > old_level:
+        # Role grants are best-effort; missing permissions must not break XP tracking.
+        for reward in reward_rows:
+            role = message.guild.get_role(int(reward["role_id"]))
+            if role and role not in message.author.roles:
+                try:
+                    await message.author.add_roles(role, reason=f"VaultBot level reward: level {reward['level']}")
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+        if settings.get("levelup_enabled", 1):
+            channel_id = int(settings.get("levelup_channel_id", 0) or message.channel.id)
+            channel = message.guild.get_channel(channel_id)
+            if channel:
+                template = str(settings.get("announcement_text", XP_DEFAULTS["announcement_text"]))
+                try:
+                    announcement = template.format(member=message.author.mention, level=new_level, xp=new_xp)
+                    await channel.send(announcement, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+                except (discord.HTTPException, ValueError, KeyError):
+                    pass
+    for key in unlocked:
+        item = XP_ACHIEVEMENTS[key]
+        try:
+            await message.channel.send(f"{item['icon']} **Achievement unlocked: {item['name']}!**\n{message.author.mention} — {item['description']}", allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+        except discord.HTTPException:
+            pass
+
+
+def _xp_reconcile_member(guild_id: int, user_id: int) -> dict:
+    """Safely reconcile one member's profile from its XP event log.
+
+    Never lowers existing stats: if the event log appears incomplete, leave the
+    profile untouched and report that fact for diagnostics.
+    """
+    with _xp_connect() as db:
+        profile = db.execute(
+            "SELECT total_xp,messages,active_days,last_active_day FROM xp_profiles WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id),
+        ).fetchone()
+        aggregate = db.execute(
+            """SELECT COALESCE(SUM(amount),0) AS total_xp,
+                      COUNT(*) AS messages,
+                      COUNT(DISTINCT substr(created_at,1,10)) AS active_days,
+                      MAX(substr(created_at,1,10)) AS last_active_day
+               FROM xp_events WHERE guild_id=? AND user_id=?""",
+            (guild_id, user_id),
+        ).fetchone()
+
+        event_xp = int(aggregate["total_xp"] or 0)
+        event_messages = int(aggregate["messages"] or 0)
+        event_days = int(aggregate["active_days"] or 0)
+        event_last_day = aggregate["last_active_day"] or ""
+        profile_xp = int(profile["total_xp"]) if profile else 0
+        profile_messages = int(profile["messages"]) if profile else 0
+        profile_days = int(profile["active_days"]) if profile else 0
+
+        # Only rebuild when the durable event ledger can account for at least
+        # every existing statistic. This avoids destroying older data if event
+        # history is incomplete.
+        safe_to_rebuild = event_messages > 0 and (
+            event_xp >= profile_xp
+            and event_messages >= profile_messages
+            and event_days >= profile_days
+        )
+        repaired = False
+        if safe_to_rebuild and (
+            profile is None
+            or event_xp != profile_xp
+            or event_messages != profile_messages
+            or event_days != profile_days
+            or (profile and str(profile["last_active_day"] or "") != event_last_day)
+        ):
+            db.execute(
+                """INSERT INTO xp_profiles(guild_id,user_id,total_xp,messages,active_days,last_active_day)
+                   VALUES(?,?,?,?,?,?)
+                   ON CONFLICT(guild_id,user_id) DO UPDATE SET
+                     total_xp=excluded.total_xp,
+                     messages=excluded.messages,
+                     active_days=excluded.active_days,
+                     last_active_day=excluded.last_active_day""",
+                (guild_id, user_id, event_xp, event_messages, event_days, event_last_day),
+            )
+            repaired = True
+
+        current = db.execute(
+            "SELECT total_xp,messages,active_days,last_active_day FROM xp_profiles WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id),
+        ).fetchone()
+        return {
+            "profile_exists": current is not None,
+            "total_xp": int(current["total_xp"]) if current else 0,
+            "messages": int(current["messages"]) if current else 0,
+            "active_days": int(current["active_days"]) if current else 0,
+            "last_active_day": str(current["last_active_day"] or "") if current else "",
+            "event_xp": event_xp,
+            "event_messages": event_messages,
+            "event_days": event_days,
+            "event_last_day": event_last_day,
+            "repaired": repaired,
+            "event_history_incomplete": bool(profile and not safe_to_rebuild and (
+                event_xp != profile_xp or event_messages != profile_messages or event_days != profile_days
+            )),
+        }
+
+
+def _xp_profile_embed(guild: discord.Guild, member: discord.Member) -> discord.Embed:
+    _xp_reconcile_member(guild.id, member.id)
+    with _xp_connect() as db:
+        row = db.execute("SELECT * FROM xp_profiles WHERE guild_id=? AND user_id=?", (guild.id, member.id)).fetchone()
+        rank = db.execute("SELECT COUNT(*)+1 FROM xp_profiles WHERE guild_id=? AND total_xp > COALESCE((SELECT total_xp FROM xp_profiles WHERE guild_id=? AND user_id=?),-1)", (guild.id, guild.id, member.id)).fetchone()[0]
+        earned = db.execute("SELECT achievement_key FROM xp_achievements WHERE guild_id=? AND user_id=? ORDER BY unlocked_at", (guild.id, member.id)).fetchall()
+    xp = int(row["total_xp"]) if row else 0
+    messages = int(row["messages"]) if row else 0
+    days = int(row["active_days"]) if row else 0
+    level, in_level, required = _xp_level_progress(xp)
+    pct = min(100, int(in_level * 100 / required))
+    bar = "▰" * (pct // 10) + "▱" * (10 - pct // 10)
+    embed = discord.Embed(title=f"⬡ {member.display_name} • VaultBot Rank", color=XP_COLOR)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.description = f"**Level {level}**  ·  Server rank **#{rank}**\n`{bar}` **{pct}%** to the next level\n**{xp:,} XP** total"
+    embed.add_field(name="Messages", value=f"{messages:,}", inline=True)
+    embed.add_field(name="Active days", value=f"{days:,}", inline=True)
+    embed.add_field(name="Achievements", value=f"{len(earned)}/{len(XP_ACHIEVEMENTS)}", inline=True)
+    if earned:
+        badges = [f"{XP_ACHIEVEMENTS[r['achievement_key']]['icon']} {XP_ACHIEVEMENTS[r['achievement_key']]['name']}" for r in earned if r["achievement_key"] in XP_ACHIEVEMENTS]
+        embed.add_field(name="Unlocked badges", value=" • ".join(badges)[:1024], inline=False)
+    embed.set_footer(text="VAULTBOT SYSTEMS  •  XP & ACHIEVEMENTS")
+    return embed
+
+
+def _xp_leaderboard_embed(guild: discord.Guild, category: str, page: int, per_page: int = 10) -> discord.Embed:
+    now = datetime.now(timezone.utc)
+    if category == "weekly":
+        start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        sql = "SELECT user_id,SUM(amount) score FROM xp_events WHERE guild_id=? AND created_at>=? GROUP BY user_id ORDER BY score DESC,user_id LIMIT ? OFFSET ?"
+        args = (guild.id, start, per_page, page * per_page)
+        label = "Weekly XP"
+    elif category == "monthly":
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+        sql = "SELECT user_id,SUM(amount) score FROM xp_events WHERE guild_id=? AND created_at>=? GROUP BY user_id ORDER BY score DESC,user_id LIMIT ? OFFSET ?"
+        args = (guild.id, start, per_page, page * per_page)
+        label = "Monthly XP"
+    elif category == "messages":
+        sql = "SELECT user_id,messages score FROM xp_profiles WHERE guild_id=? ORDER BY score DESC,total_xp DESC LIMIT ? OFFSET ?"
+        args = (guild.id, per_page, page * per_page); label = "Messages"
+    elif category == "achievements":
+        sql = "SELECT user_id,COUNT(*) score FROM xp_achievements WHERE guild_id=? GROUP BY user_id ORDER BY score DESC,user_id LIMIT ? OFFSET ?"
+        args = (guild.id, per_page, page * per_page); label = "Achievements"
+    elif category == "level":
+        sql = "SELECT user_id,total_xp score FROM xp_profiles WHERE guild_id=? ORDER BY total_xp DESC,user_id LIMIT ? OFFSET ?"
+        args = (guild.id, per_page, page * per_page); label = "Level"
+    else:
+        sql = "SELECT user_id,total_xp score FROM xp_profiles WHERE guild_id=? ORDER BY total_xp DESC,user_id LIMIT ? OFFSET ?"
+        args = (guild.id, per_page, page * per_page); label = "Total XP"
+    with _xp_connect() as db:
+        rows = db.execute(sql, args).fetchall()
+        if category == "weekly":
+            count = db.execute("SELECT COUNT(DISTINCT user_id) FROM xp_events WHERE guild_id=? AND created_at>=?", (guild.id, start)).fetchone()[0]
+        elif category == "monthly":
+            count = db.execute("SELECT COUNT(DISTINCT user_id) FROM xp_events WHERE guild_id=? AND created_at>=?", (guild.id, start)).fetchone()[0]
+        elif category == "achievements":
+            count = db.execute("SELECT COUNT(DISTINCT user_id) FROM xp_achievements WHERE guild_id=?", (guild.id,)).fetchone()[0]
+        else:
+            count = db.execute("SELECT COUNT(*) FROM xp_profiles WHERE guild_id=?", (guild.id,)).fetchone()[0]
+    lines = []
+    for i, row in enumerate(rows, start=page * per_page + 1):
+        member = guild.get_member(int(row["user_id"]))
+        if not member:
+            continue
+        score = int(row["score"] or 0)
+        if category == "level":
+            value = f"Level {_xp_level(score)} · {score:,} XP"
+        elif category == "achievements":
+            value = f"{score} achievement(s)"
+        elif category == "messages":
+            value = f"{score:,} messages"
+        else:
+            value = f"{score:,} XP"
+        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"`#{i}`")
+        lines.append(f"{medal} **{discord.utils.escape_markdown(member.display_name)}** — {value}")
+    embed = discord.Embed(title=f"🏆 VaultBot • {label} Leaderboard", description="\n".join(lines) if lines else "No rankings yet. Start chatting to earn XP!", color=XP_COLOR)
+    embed.set_footer(text=f"Page {page + 1} · {max(1, (count + per_page - 1) // per_page)}  •  {guild.name}")
+    return embed
+
+
+class XPLeaderboardView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, user_id: int, category: str = "xp", page: int = 0):
+        super().__init__(timeout=180)
+        self.guild, self.user_id, self.category, self.page = guild, user_id, category, page
+        options = [discord.SelectOption(label="Total XP", value="xp", emoji="⚡"),
+                   discord.SelectOption(label="Highest Level", value="level", emoji="🌟"),
+                   discord.SelectOption(label="Messages", value="messages", emoji="💬"),
+                   discord.SelectOption(label="Achievements", value="achievements", emoji="🏅"),
+                   discord.SelectOption(label="Weekly XP", value="weekly", emoji="📅"),
+                   discord.SelectOption(label="Monthly XP", value="monthly", emoji="🗓️")]
+        for option in options:
+            option.default = option.value == category
+        self.category_select = discord.ui.Select(placeholder="Choose leaderboard category…", options=options, row=0)
+        self.category_select.callback = self._select_category
+        self.add_item(self.category_select)
+        prev = discord.ui.Button(label="Previous", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+        prev.callback = self._previous
+        self.add_item(prev)
+        nxt = discord.ui.Button(label="Next", emoji="▶️", style=discord.ButtonStyle.primary, row=1)
+        nxt.callback = self._next
+        self.add_item(nxt)
+        profile = discord.ui.Button(label="My Rank", emoji="👤", style=discord.ButtonStyle.success, row=1)
+        profile.callback = self._my_rank
+        self.add_item(profile)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Run `/leaderboard` yourself to open your own controls.", ephemeral=True)
+            return False
+        return True
+
+    async def _refresh(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(embed=_xp_leaderboard_embed(self.guild, self.category, self.page), view=self)
+
+    async def _select_category(self, interaction: discord.Interaction):
+        self.category = self.category_select.values[0]; self.page = 0
+        for option in self.category_select.options: option.default = option.value == self.category
+        await self._refresh(interaction)
+
+    async def _previous(self, interaction: discord.Interaction):
+        self.page = max(0, self.page - 1); await self._refresh(interaction)
+
+    async def _next(self, interaction: discord.Interaction):
+        self.page += 1
+        embed = _xp_leaderboard_embed(self.guild, self.category, self.page)
+        if embed.description == "No rankings yet. Start chatting to earn XP!": self.page = max(0, self.page - 1)
+        await interaction.response.edit_message(embed=_xp_leaderboard_embed(self.guild, self.category, self.page), view=self)
+
+    async def _my_rank(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(embed=_xp_profile_embed(self.guild, interaction.user), view=None)
+
+
+class XPHubView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, user_id: int):
+        super().__init__(timeout=180); self.guild, self.user_id = guild, user_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Use `/xp` to open your own menu.", ephemeral=True); return False
+        return True
+
+    @discord.ui.button(label="My Rank", emoji="👤", style=discord.ButtonStyle.primary, row=0)
+    async def rank(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=_xp_profile_embed(self.guild, interaction.user), view=self)
+
+    @discord.ui.button(label="Leaderboard", emoji="🏆", style=discord.ButtonStyle.primary, row=0)
+    async def leaderboard(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = XPLeaderboardView(self.guild, interaction.user.id)
+        await interaction.response.edit_message(embed=_xp_leaderboard_embed(self.guild, "xp", 0), view=view)
+
+    @discord.ui.button(label="Achievements", emoji="🏅", style=discord.ButtonStyle.secondary, row=0)
+    async def achievements(self, interaction: discord.Interaction, button: discord.ui.Button):
+        with _xp_connect() as db:
+            earned = {r["achievement_key"] for r in db.execute("SELECT achievement_key FROM xp_achievements WHERE guild_id=? AND user_id=?", (self.guild.id, interaction.user.id)).fetchall()}
+        lines = []
+        for key, item in XP_ACHIEVEMENTS.items():
+            status = "✅" if key in earned else "🔒"
+            lines.append(f"{status} {item['icon']} **{item['name']}** — {item['description']} *({item['rarity']})*")
+        embed = discord.Embed(title="🏅 VaultBot Achievements", description="\n".join(lines), color=XP_COLOR)
+        embed.set_footer(text=f"Unlocked {len(earned)} of {len(XP_ACHIEVEMENTS)} achievements")
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Admin Settings", emoji="⚙️", style=discord.ButtonStyle.secondary, row=1)
+    async def admin(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("You need **Manage Server** to open XP settings.", ephemeral=True); return
+        view = XPAdminView(self.guild, interaction.user.id)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+
+class XPSettingsModal(discord.ui.Modal, title="VaultBot XP Settings"):
+    xp_min = discord.ui.TextInput(label="Minimum XP per message", default="15", max_length=4)
+    xp_max = discord.ui.TextInput(label="Maximum XP per message", default="25", max_length=4)
+    cooldown = discord.ui.TextInput(label="Message cooldown in seconds", default="60", max_length=4)
+    async def on_submit(self, interaction: discord.Interaction):
+        settings = _xp_settings(interaction.guild_id)
+        try:
+            low, high, cooldown = int(self.xp_min.value), int(self.xp_max.value), int(self.cooldown.value)
+            if low < 0 or high < low or high > 1000 or not 1 <= cooldown <= 3600: raise ValueError
+        except ValueError:
+            await interaction.response.send_message("Invalid values. Use XP values from 0–1000 with max ≥ min, and cooldown 1–3600 seconds.", ephemeral=True); return
+        settings.update(xp_min=low, xp_max=high, cooldown=cooldown)
+        _xp_save_settings(interaction.guild_id, settings)
+        await interaction.response.send_message(f"Saved. XP per message: **{low}–{high}**; cooldown: **{cooldown}s**.", ephemeral=True)
+
+
+class XPAdminView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, user_id: int):
+        super().__init__(timeout=180); self.guild, self.user_id = guild, user_id
+    def build_embed(self):
+        s = _xp_settings(self.guild.id)
+        embed = discord.Embed(title="⚙️ VaultBot • XP Control Center", description="Configure the leveling system for this server.", color=XP_COLOR)
+        embed.add_field(name="System", value="Enabled" if s.get("enabled", 1) else "Disabled", inline=True)
+        embed.add_field(name="XP range", value=f"{s.get('xp_min',15)}–{s.get('xp_max',25)}", inline=True)
+        embed.add_field(name="Cooldown", value=f"{s.get('cooldown',60)}s", inline=True)
+        embed.add_field(name="Level-up announcements", value="Enabled" if s.get("levelup_enabled",1) else "Disabled", inline=True)
+        embed.add_field(name="Ignored channels", value=str(len([x for x in str(s.get('ignored_channels','')).split(',') if x.strip()])), inline=True)
+        embed.set_footer(text="Manage Server required • Settings persist across restarts")
+        return embed
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id or not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("Only the administrator who opened this panel can use it.", ephemeral=True); return False
+        return True
+    @discord.ui.button(label="Edit XP & Cooldown", emoji="⚡", style=discord.ButtonStyle.primary, row=0)
+    async def edit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = _xp_settings(self.guild.id); modal = XPSettingsModal()
+        modal.xp_min.default = str(s.get("xp_min",15)); modal.xp_max.default = str(s.get("xp_max",25)); modal.cooldown.default = str(s.get("cooldown",60))
+        await interaction.response.send_modal(modal)
+    @discord.ui.button(label="Toggle XP", emoji="🔛", style=discord.ButtonStyle.secondary, row=0)
+    async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = _xp_settings(self.guild.id); s["enabled"] = 0 if s.get("enabled",1) else 1; _xp_save_settings(self.guild.id,s)
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+    @discord.ui.button(label="Toggle Level-Up Posts", emoji="📣", style=discord.ButtonStyle.secondary, row=0)
+    async def announcements(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = _xp_settings(self.guild.id); s["levelup_enabled"] = 0 if s.get("levelup_enabled",1) else 1; _xp_save_settings(self.guild.id,s)
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+    @discord.ui.button(label="Set Announcement Channel", emoji="📍", style=discord.ButtonStyle.secondary, row=1)
+    async def channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("Use `/xpchannel` in the server to choose the level-up announcement channel.", ephemeral=True)
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.success, row=1)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+
+@bot.tree.command(name="xp", description="Open VaultBot's XP, levels, and achievements hub")
+async def xp_hub(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("Use this command inside a server.", ephemeral=True); return
+    view = XPHubView(interaction.guild, interaction.user.id)
+    embed = discord.Embed(title="⬡ VAULTBOT • LEVELING HUB", description="Earn XP by chatting, level up, unlock achievements, and climb the leaderboard.\n\nChoose an option below to get started.\nUse `/xpcheck` for a private XP data diagnostic.", color=XP_COLOR)
+    embed.set_footer(text="VAULTBOT SYSTEMS  •  XP / LEVELS / ACHIEVEMENTS")
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=False)
+
+
+@bot.tree.command(name="xpcheck", description="Privately check and safely reconcile your own XP stats")
+async def xp_check(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("Use this command inside a server.", ephemeral=True)
+        return
+
+    result = _xp_reconcile_member(interaction.guild.id, interaction.user.id)
+    settings = _xp_settings(interaction.guild.id)
+    ignored_channels = [x.strip() for x in str(settings.get("ignored_channels", "")).split(",") if x.strip()]
+    ignored_roles = [x.strip() for x in str(settings.get("ignored_roles", "")).split(",") if x.strip()]
+    user_role_ids = {role.id for role in getattr(interaction.user, "roles", [])}
+    try:
+        ignored_channel_ids = {int(value) for value in ignored_channels}
+        ignored_role_ids = {int(value) for value in ignored_roles}
+    except ValueError:
+        ignored_channel_ids, ignored_role_ids = set(), set()
+    currently_ignored_channel = interaction.channel_id in ignored_channel_ids
+    has_ignored_role = bool(user_role_ids & ignored_role_ids)
+    if result["repaired"]:
+        status = "✅ Reconciled your profile using your saved XP event history."
+    elif result["event_history_incomplete"]:
+        status = "⚠️ Your profile and event history disagree, but I left your data unchanged because the event history may be incomplete."
+    elif result["event_messages"] == 0 and result["total_xp"] > 0:
+        status = "⚠️ You have saved XP but no event history. I left your data unchanged."
+    elif not result["profile_exists"]:
+        status = "ℹ️ No XP profile or XP event history exists for your account in this server yet."
+    else:
+        status = "✅ Your profile matches the saved XP event history."
+
+    embed = discord.Embed(title="🔎 Your VaultBot XP Diagnostics", description=status, color=XP_COLOR)
+    embed.add_field(name="Your Discord ID", value=f"`{interaction.user.id}`", inline=True)
+    embed.add_field(name="Server ID", value=f"`{interaction.guild.id}`", inline=True)
+    embed.add_field(name="Current profile", value=(
+        f"XP: **{result['total_xp']:,}**\n"
+        f"Messages: **{result['messages']:,}**\n"
+        f"Active days: **{result['active_days']:,}**\n"
+        f"Last active day: **{result['last_active_day'] or '—'}**"
+    ), inline=False)
+    embed.add_field(name="Saved event history", value=(
+        f"XP total: **{result['event_xp']:,}**\n"
+        f"Events/messages: **{result['event_messages']:,}**\n"
+        f"Active days: **{result['event_days']:,}**\n"
+        f"Last event day: **{result['event_last_day'] or '—'}**"
+    ), inline=False)
+    embed.add_field(name="XP tracking settings", value=(
+        f"Enabled: **{'Yes' if settings.get('enabled', 1) else 'No'}**\n"
+        f"Ignored channels configured: **{len(ignored_channels)}**\n"
+        f"Ignored roles configured: **{len(ignored_roles)}**\n"
+        f"This channel ignored: **{'Yes' if currently_ignored_channel else 'No'}**\n"
+        f"You have an ignored role: **{'Yes' if has_ignored_role else 'No'}**\n"
+        f"XP database: **configured**"
+    ), inline=False)
+    embed.set_footer(text="Private to you • No other member's XP data was changed")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="rank", description="View your rank or another member's VaultBot XP profile")
+@app_commands.describe(member="Member whose profile you want to view")
+async def xp_rank(interaction: discord.Interaction, member: Optional[discord.Member] = None):
+    if not interaction.guild:
+        await interaction.response.send_message("Use this command inside a server.", ephemeral=True); return
+    await interaction.response.send_message(embed=_xp_profile_embed(interaction.guild, member or interaction.user), ephemeral=False)
+
+
+@bot.tree.command(name="leaderboard", description="Browse VaultBot XP and achievement leaderboards")
+async def xp_leaderboard(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("Use this command inside a server.", ephemeral=True); return
+    view = XPLeaderboardView(interaction.guild, interaction.user.id)
+    await interaction.response.send_message(embed=_xp_leaderboard_embed(interaction.guild, "xp", 0), view=view)
+
+
+@bot.tree.command(name="achievements", description="Browse VaultBot achievements for yourself or a member")
+@app_commands.describe(member="Member whose achievements you want to view")
+async def xp_achievements(interaction: discord.Interaction, member: Optional[discord.Member] = None):
+    if not interaction.guild:
+        await interaction.response.send_message("Use this command inside a server.", ephemeral=True); return
+    target = member or interaction.user
+    with _xp_connect() as db:
+        earned = {r["achievement_key"] for r in db.execute("SELECT achievement_key FROM xp_achievements WHERE guild_id=? AND user_id=?", (interaction.guild.id, target.id)).fetchall()}
+    lines = [f"{'✅' if key in earned else '🔒'} {item['icon']} **{item['name']}** — {item['description']} *({item['rarity']})*" for key, item in XP_ACHIEVEMENTS.items()]
+    embed = discord.Embed(title=f"🏅 {target.display_name}'s Achievements", description="\n".join(lines), color=XP_COLOR)
+    embed.set_footer(text=f"Unlocked {len(earned)} of {len(XP_ACHIEVEMENTS)}")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="xpadmin", description="Open VaultBot's XP administration panel")
+@app_commands.default_permissions(manage_guild=True)
+async def xp_admin(interaction: discord.Interaction):
+    if not interaction.guild or not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("You need **Manage Server** permission to configure XP.", ephemeral=True); return
+    view = XPAdminView(interaction.guild, interaction.user.id)
+    await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
+
+
+@bot.tree.command(name="xpchannel", description="Set the channel for VaultBot level-up announcements")
+@app_commands.describe(channel="Channel where level-up announcements should be posted")
+@app_commands.default_permissions(manage_guild=True)
+async def xp_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not interaction.guild or not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("You need **Manage Server** permission.", ephemeral=True); return
+    settings = _xp_settings(interaction.guild.id); settings["levelup_channel_id"] = channel.id; _xp_save_settings(interaction.guild.id, settings)
+    await interaction.response.send_message(f"Level-up announcements will be sent to {channel.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="xpreward", description="Set or update a level-based role reward")
+@app_commands.describe(level="Level required to earn this role", role="Role granted at this level")
+@app_commands.default_permissions(manage_guild=True)
+async def xp_reward(interaction: discord.Interaction, level: app_commands.Range[int, 1, 1000], role: discord.Role):
+    if not interaction.guild or not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("You need **Manage Server** permission.", ephemeral=True); return
+    if role.is_default() or role >= interaction.guild.me.top_role:
+        await interaction.response.send_message("I can't grant that role. Move my role above the reward role and choose a normal server role.", ephemeral=True); return
+    with _xp_connect() as db:
+        db.execute("INSERT INTO xp_level_rewards(guild_id,level,role_id) VALUES(?,?,?) ON CONFLICT(guild_id,level) DO UPDATE SET role_id=excluded.role_id", (interaction.guild.id, level, role.id))
+    await interaction.response.send_message(f"Saved reward: members reaching level **{level}** will receive {role.mention}.", ephemeral=True)
+
+
+# Initialize storage before the bot starts. Errors fail loudly instead of silently losing XP.
+_xp_init_db()
+print(f"[XP] SQLite storage ready: {XP_DB_PATH}")
+
+
+
+# =============================================================================
 # VAULT CONTROL CENTER — lightweight interactive dashboard
 # =============================================================================
 VAULT_RED = discord.Color.from_rgb(255, 35, 55)
@@ -5906,26 +7260,27 @@ def _vault_control_embed(page: str, guild: Optional[discord.Guild]) -> discord.E
         modules = [
             ('🎮 GAME RADAR', '`/freestuff` • `/patchnotes`', 'Free offers, Steam game announcements, and supported game feeds.'),
             ('🎵 MUSIC ENGINE', '`~play` • `~queue` • `~nowplaying`', 'Voice playback and queue controls.'),
+            ('🖤 JUICE WRLD', '`~jwsong`', 'Song/catalog search and optional tracker notifications.'),
             ('🛡️ MODERATION', '`~ban` • `~timeout` • `~clear`', 'Server moderation tools, subject to permissions.'),
         ]
         for name, commands_text, description in modules:
             embed.add_field(name=name, value=f'{description}\n{commands_text}', inline=False)
         embed.set_footer(text='Some notification systems require channel/API settings before they can deliver alerts.')
     elif page == 'community':
-        embed.title = '▰ COMMUNITY & TOOLS'
-        embed.description = 'Member information, server activity, and staff communication tools.'
-        embed.add_field(name='👤 MEMBER PROFILES', value='`~profile [member]` — account age, server join date, tenure, roles, and recorded join/leave history.', inline=False)
-        embed.add_field(name='📊 SERVER ACTIVITY', value='`/memberstats` and `/serverwidget` — show server membership and activity information where Discord provides it.', inline=False)
-        embed.add_field(name='📣 COMMUNITY TOOLS', value='`/announce` — staff announcements\n`/musicdrop` — publish a music release embed with download links.', inline=False)
-        embed.add_field(name='🧹 MODERATION', value='`~ban`, `~unban`, `~timeout`, `~untimeout`, and `~clear` — staff moderation tools protected by permissions.', inline=False)
-        embed.set_footer(text='Staff tools remain subject to Discord permissions and role hierarchy.')
+        embed.title = '▰ COMMUNITY & PROGRESSION'
+        embed.description = 'Member-facing tools for activity, recognition, and server discovery.'
+        embed.add_field(name='🏆 XP & LEVELS', value='`/xp` — open the XP hub\n`/rank` — view a member rank\n`/leaderboard` — browse rankings', inline=False)
+        embed.add_field(name='✨ ACHIEVEMENTS', value='`/achievements` — browse achievement progress\n`/xpreward` — configure level role rewards (staff)', inline=False)
+        embed.add_field(name='👤 MEMBER PROFILES', value='`~profile` — view member information and available profile stats.', inline=False)
+        embed.add_field(name='📣 COMMUNITY TOOLS', value='`/announce` — staff announcements\n`/musicdrop` — publish a music release with link buttons', inline=False)
+        embed.set_footer(text='Role rewards and administration actions still follow Discord permissions.')
     elif page == 'commands':
         embed.title = '▰ QUICK COMMANDS'
         embed.description = 'Jump straight into the features you use most.'
         embed.add_field(name='START HERE', value='`/vault` or `~vault` — this dashboard\n`/help` or `~help` — full interactive command guide\n`/ping` — connection latency', inline=False)
         embed.add_field(name='GAMING & ALERTS', value='`/freestuff` • `/patchnotes`', inline=False)
         embed.add_field(name='MUSIC', value='`~play <song>` • `~queue` • `~skip` • `~pause` • `~resume` • `~nowplaying`', inline=False)
-        embed.add_field(name='COMMUNITY & MODERATION', value='`~profile` • `~ban` • `~timeout` • `/announce` • `/memberstats`', inline=False)
+        embed.add_field(name='XP & COMMUNITY', value='`/xp` • `/rank` • `/leaderboard` • `/achievements`', inline=False)
         embed.add_field(name='OWNER / STAFF', value='Use `/help` for the full list and permission notes. Admin-only actions remain permission-gated.', inline=False)
         embed.set_footer(text='Tip: Discord slash commands appear in the / command picker.')
     else:  # refresh uses overview content
