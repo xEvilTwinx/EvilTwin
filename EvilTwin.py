@@ -45,7 +45,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse, urlencode, urljoin
+from urllib.parse import urlparse, urlencode, urljoin, urlsplit, urlunsplit, quote
+import io
 
 import aiohttp
 import discord
@@ -71,9 +72,28 @@ PREFIX = "~"
 # Embed colours.
 BRAND_COLOR = discord.Color.from_rgb(28, 27, 32)
 JUICE_COLOR = discord.Color.from_rgb(123, 44, 191)
+MUSIC_COLOR = discord.Color.from_rgb(0, 225, 255)      # neon cyan (matches the update cards)
+MUSIC_WARN_COLOR = discord.Color.from_rgb(255, 120, 40)
+MUSIC_ERROR_COLOR = discord.Color.from_rgb(255, 35, 55)
+MUSIC_BAR = "▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱"
+MUSIC_EQ = "▁▃▅▇▅▃▁▃▅▇▅▃▁▃▅▇▅▃▁▃"
+MUSIC_AUTHOR = "VAULTBOT  //  AUDIO SYSTEM"
+MUSIC_FOOTER = "⬡ VAULTBOT AUDIO  //  LIVE PLAYER"
 
 # Music settings.
 DEFAULT_VOLUME = 0.5
+MAX_VOLUME_PERCENT = 200  # 100 = original loudness; above that the audio is amplified
+# MP3 bitrate requested from the Juice WRLD API for playback/radio. The API answered "406 Not Acceptable"
+# to 320k for every track, so keep this at 160k (the value that worked). If you try another value, watch the
+# console: repeated "406" lines mean the API rejects it and every song falls back to the slower original file.
+JW_PLAYBACK_BITRATE = "160k"
+# --- Traffic savers (hosting plans meter inbound + outbound data together) ---------------------------
+# Voice audio sent to Discord counts as outbound traffic: ~43 MB/hour at 96 kbps, ~58 MB/hour at 128 kbps.
+MUSIC_MAX_KBPS = 96
+# Radio skips audio files bigger than this (big WAVs waste data and usually time out anyway).
+JW_RADIO_MAX_MB = 15
+# Leave the voice channel after this many seconds with no humans in it (0 = never leave).
+VOICE_IDLE_LEAVE_SECONDS = 120
 ALLOWED_UPLOAD_SUFFIXES = {".mp3", ".wav", ".opus", ".ogg", ".m4a", ".flac"}
 MAX_UPLOAD_MB = 20
 
@@ -100,6 +120,12 @@ JUICEWRLD_POLL_MINUTES = _positive_int_env("JUICEWRLD_POLL_MINUTES", 5)
 JUICEWRLD_STATE_FILE = Path(os.getenv(
     "JUICEWRLD_STATE_FILE",
     str(Path(tempfile.gettempdir()) / "juicewrld_seen.json")
+))
+# A small persistent catalog cache lets radio start without re-downloading the
+# full file listing after every bot restart. /data is persistent on the current host.
+JUICEWRLD_CATALOG_CACHE_FILE = Path(os.getenv(
+    "JUICEWRLD_CATALOG_CACHE_FILE",
+    "/data/juicewrld_audio_catalog.json",
 ))
 
 
@@ -154,7 +180,13 @@ _yt_clients = [c.strip() for c in os.getenv("YT_PLAYER_CLIENTS", "").split(",") 
 if _yt_clients:
     YTDL_OPTIONS["extractor_args"] = {"youtube": {"player_client": _yt_clients}}
 
-FFMPEG_OPTIONS = {"options": "-vn -threads 1"}
+# Normalize audio timing and send a short silent pre-roll before the first audible
+# samples. This gives the Discord voice connection/Opus encoder a moment to settle,
+# which can help prevent the first instant of a track sounding rushed or garbled.
+# Audio is still decoded to discord.py's standard 48 kHz stereo PCM format.
+FFMPEG_OPTIONS = {
+    "options": "-vn -threads 1 -af aresample=48000:async=1:first_pts=0,adelay=300|300"
+}
 
 
 # This build intentionally does not read or create YouTube cookie files.
@@ -246,6 +278,10 @@ loop_modes: dict[int, str] = {}  # off, song, queue
 volumes: dict[int, float] = {}
 now_playing_messages: dict[int, discord.Message] = {}
 queue_locks: dict[int, asyncio.Lock] = {}
+# Per-server radio state. While active, manual play commands are blocked so
+# the continuous Juice WRLD radio owns the shared music session.
+jw_radio_active: set[int] = set()
+jw_radio_starting: set[int] = set()
 TEMP_FILES: set[str] = set()
 
 
@@ -291,18 +327,90 @@ def clean_temp_file(path: Optional[str]) -> None:
     TEMP_FILES.discard(path)
 
 
+_MUSIC_GLYPHS = (
+    ("✅", "◈"), ("🎶", "◈"), ("🎵", "◈"), ("🔎", "◎"), ("⚠️", "▲"), ("⚠", "▲"),
+    ("❌", "✕"), ("📻", "◉"), ("➕", "▣"),
+)
+
+
+def _music_glyph_title(title: str) -> str:
+    """Swap a leading emoji for a clean geometric glyph, matching the update-card style."""
+    text = (title or "").strip()
+    for emoji, glyph in _MUSIC_GLYPHS:
+        if text.startswith(emoji):
+            return f"{glyph}  {text[len(emoji):].strip()}"[:256]
+    return text[:256]
+
+
+def _music_status_embed(title: str, description: str, color=None) -> discord.Embed:
+    """Futuristic status card used by every music/radio acknowledgement."""
+    embed = discord.Embed(
+        title=_music_glyph_title(title),
+        description=(description or "")[:4000],
+        color=color if color is not None else MUSIC_COLOR,
+    )
+    embed.set_author(name=MUSIC_AUTHOR)
+    embed.set_footer(text=MUSIC_FOOTER)
+    return embed
+
+
+def _music_source_label(track: Track) -> str:
+    return str(track.source_name or "audio").split(":")[0].upper()[:24]
+
+
 def build_now_playing_embed(track: Track, loop_mode: Optional[str] = None) -> discord.Embed:
     """Embed shown by the 'Now Playing' announcement and ~nowplaying."""
+    source = _music_source_label(track)
+    is_radio = track.requester == "Juice WRLD Radio"
+    is_juice = is_radio or "JUICE" in source
+    chips = f"`◈ NOW PLAYING`  `⬡ {source}`"
+    if is_radio:
+        chips += "  `◉ RADIO`"
+    url = track.webpage_url if str(track.webpage_url or "").startswith(("https://", "http://")) else None
     embed = discord.Embed(
-        title="🎶 Now Playing",
-        description=f"[{discord.utils.escape_markdown(track.title)}]({track.webpage_url})",
-        color=BRAND_COLOR,
+        title=f"◈  {track.title}"[:256],
+        url=url,
+        description=f"{chips}\n{MUSIC_EQ}",
+        color=JUICE_COLOR if is_juice else MUSIC_COLOR,
     )
-    embed.add_field(name="Duration", value=format_duration(track.duration), inline=True)
-    embed.add_field(name="Requested by", value=track.requester, inline=True)
+    embed.set_author(name=MUSIC_AUTHOR)
+    embed.add_field(name="◷  DURATION", value=f"`{format_duration(track.duration)}`", inline=True)
+    embed.add_field(name="⌘  REQUESTED BY", value=str(track.requester)[:100], inline=True)
     if loop_mode is not None:
-        embed.set_footer(text=f"Loop: {loop_mode}")
+        embed.add_field(name="▣  LOOP", value=f"`{str(loop_mode).upper()}`", inline=True)
+    embed.set_footer(text=MUSIC_FOOTER)
     return embed
+
+
+async def _set_music_status(
+    ctx: commands.Context,
+    message: Optional[discord.Message],
+    title: str,
+    description: str,
+    *,
+    color: int = None,
+) -> None:
+    """Edit the instant music-command acknowledgement instead of leaving users waiting."""
+    # Keep the semantic colours for problems, use the neon accent for everything else.
+    if isinstance(color, discord.Color):
+        color = color.value
+    if color is None or color == discord.Color.green().value or color == BRAND_COLOR.value:
+        color = MUSIC_COLOR
+    elif color == discord.Color.orange().value:
+        color = MUSIC_WARN_COLOR
+    elif color == discord.Color.red().value:
+        color = MUSIC_ERROR_COLOR
+    embed = _music_status_embed(title, description, color)
+    if message is not None:
+        try:
+            await message.edit(embed=embed)
+            return
+        except (discord.HTTPException, discord.NotFound):
+            pass
+    try:
+        await ctx.send(embed=embed)
+    except discord.HTTPException:
+        pass
 
 
 # =============================================================================
@@ -402,9 +510,16 @@ async def _fallback_search_variants(query: str) -> list:
     return out
 
 
-async def extract_track(query: str, requester: str) -> Track:
-    """Find and download one playable audio track with one yt-dlp extraction pass."""
-    def _extract(query: str):
+async def extract_track(query: str, requester: str, on_found=None) -> Track:
+    """Find and download one playable audio track with one yt-dlp extraction pass.
+
+    When provided, on_found(title) is called as soon as yt-dlp resolves a result
+    and begins downloading it, so the Discord status embed can update before the
+    full audio file finishes downloading.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _extract(query: str, notify_found=None):
         folder = tempfile.mkdtemp(prefix="vaultbot_audio_")
         options = dict(YTDL_OPTIONS)
         options.update({
@@ -414,6 +529,27 @@ async def extract_track(query: str, requester: str) -> Track:
             "playlist_items": "1",
             "skip_download": False,
         })
+        found_notified = False
+
+        def progress_hook(progress):
+            nonlocal found_notified
+            if found_notified or progress.get("status") != "downloading" or notify_found is None:
+                return
+            info = progress.get("info_dict") or {}
+            title = str(info.get("title") or "").strip()
+            if not title:
+                return
+            found_notified = True
+            try:
+                # Wait for the embed edit to finish before continuing download,
+                # preventing a late 'Found' update from overwriting the queued state.
+                future = asyncio.run_coroutine_threadsafe(notify_found(title), loop)
+                future.result(timeout=10)
+            except Exception as hook_exc:
+                print(f"[music status] Could not update found-song embed: {hook_exc}", flush=True)
+
+        if on_found is not None:
+            options["progress_hooks"] = list(options.get("progress_hooks") or []) + [progress_hook]
 
         try:
             diag("yt-dlp: starting one-pass search/extraction/download")
@@ -473,7 +609,7 @@ async def extract_track(query: str, requester: str) -> Track:
 
     async with _YTDL_SEMAPHORE:
         try:
-            data = await asyncio.to_thread(_extract, query)
+            data = await asyncio.to_thread(_extract, query, on_found)
         except Exception as exc:
             if not _is_signin_error(str(exc)):
                 raise
@@ -490,7 +626,7 @@ async def extract_track(query: str, requester: str) -> Track:
                 if not sc_url:
                     continue
                 try:
-                    data = await asyncio.to_thread(_extract, sc_url)
+                    data = await asyncio.to_thread(_extract, sc_url, on_found)
                     break
                 except Exception as sc_exc:
                     print(f"[fallback] SoundCloud download failed: {sc_exc}", flush=True)
@@ -527,15 +663,75 @@ async def play_next(ctx: commands.Context) -> None:
         if not voice or not voice.is_connected():
             current_tracks.pop(guild_id, None)
             return
-
         previous = current_tracks.get(guild_id)
-        mode = loop_modes.get(guild_id, "off")
+        # Radio owns playback while active, so ordinary loop modes cannot
+        # prevent the next random track from being selected.
+        mode = "off" if guild_id in jw_radio_active else loop_modes.get(guild_id, "off")
         if previous and mode == "song":
             get_queue(guild_id).appendleft(previous)
         elif previous and mode == "queue":
             get_queue(guild_id).append(previous)
         elif previous:
             clean_temp_file(previous.local_path)
+
+        if not get_queue(guild_id) and guild_id in jw_radio_active:
+            # Radio fetches the next random track only when the shared queue is
+            # empty. The starting guard prevents a duplicate fetch if a song
+            # ends while the initial radio command is downloading its seed.
+            if guild_id in jw_radio_starting:
+                current_tracks.pop(guild_id, None)
+                return
+            jw_radio_starting.add(guild_id)
+            try:
+                avoid_title = (
+                    previous.title
+                    if previous and previous.requester == "Juice WRLD Radio"
+                    else ""
+                )
+                last_radio_error = None
+                track = None
+                # A transient API timeout should not permanently turn radio off.
+                # Each fetch already tries several candidate audio files; retry the
+                # catalog lookup too before declaring radio unavailable.
+                for radio_attempt in range(3):
+                    try:
+                        track = await _fetch_random_jw_track(
+                            "Juice WRLD Radio", avoid_title=avoid_title
+                        )
+                        break
+                    except (aiohttp.ClientError, asyncio.TimeoutError, OSError, RuntimeError) as exc:
+                        last_radio_error = exc
+                        print(
+                            f"[JuiceWRLD Radio] Fetch attempt {radio_attempt + 1}/3 failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        if radio_attempt < 2:
+                            await asyncio.sleep(2 * (radio_attempt + 1))
+                if track is None:
+                    raise last_radio_error or RuntimeError("No playable radio track was returned.")
+            except Exception as exc:
+                jw_radio_active.discard(guild_id)
+                current_tracks.pop(guild_id, None)
+                print(f"[JuiceWRLD Radio] Could not fetch next track: {type(exc).__name__}: {exc}")
+                try:
+                    await ctx.send(embed=_music_status_embed(
+                        "⚠️ JUICE WRLD RADIO  //  STOPPED",
+                        f"`▲ API / DOWNLOAD FAILURE`\n{MUSIC_BAR}\n\n"
+                        "Radio stopped after repeated failures.\n"
+                        "▸ Try `~jwradio` again in a minute\n\n"
+                        f"> {discord.utils.escape_markdown(str(exc))[:180]}",
+                        MUSIC_WARN_COLOR,
+                    ))
+                except discord.HTTPException:
+                    pass
+                return
+            finally:
+                jw_radio_starting.discard(guild_id)
+            if guild_id not in jw_radio_active:
+                clean_temp_file(track.local_path)
+                current_tracks.pop(guild_id, None)
+                return
+            get_queue(guild_id).append(track)
 
         if not get_queue(guild_id):
             current_tracks.pop(guild_id, None)
@@ -564,7 +760,11 @@ async def play_next(ctx: commands.Context) -> None:
                 except RuntimeError as exc:
                     print(f"Could not schedule next track: {exc}")
 
-            voice.play(source, after=after_playback)
+            try:
+                voice.play(source, after=after_playback, **_opus_play_kwargs(voice))
+            except TypeError:
+                # Older discord.py without Opus encoder options: play with the defaults.
+                voice.play(source, after=after_playback)
             # Keep the voice player's audio source alive and announce the track.
             await update_now_playing(ctx, track)
         except Exception as error:
@@ -576,6 +776,22 @@ async def play_next(ctx: commands.Context) -> None:
             current_tracks.pop(guild_id, None)
             # Try the next queued track.
             bot.loop.call_soon(lambda: asyncio.create_task(play_next(ctx)))
+
+
+def _opus_play_kwargs(voice) -> dict:
+    """Better Opus encoding for music.
+
+    discord.py's defaults are 128 kbps, signal_type 'auto' and 15% expected packet loss
+    (which makes the encoder spend bits on error protection instead of sound quality).
+    Use the voice channel's own bitrate as the target (capped at MUSIC_MAX_KBPS to limit data use), tell the
+    encoder the signal is music, and assume only a little packet loss.
+    """
+    kbps = 128
+    try:
+        kbps = int((getattr(voice.channel, "bitrate", 128000) or 128000) // 1000)
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return {"bitrate": max(64, min(kbps, MUSIC_MAX_KBPS)), "signal_type": "music", "expected_packet_loss": 0.05}
 
 
 async def ensure_voice(ctx: commands.Context) -> discord.VoiceClient:
@@ -591,14 +807,32 @@ async def ensure_voice(ctx: commands.Context) -> discord.VoiceClient:
     return await ctx.author.voice.channel.connect()
 
 
-async def queue_track(ctx: commands.Context, track: Track) -> None:
+async def queue_track(
+    ctx: commands.Context,
+    track: Track,
+    *,
+    status_message: Optional[discord.Message] = None,
+) -> None:
     guild_id = ctx.guild.id
     get_queue(guild_id).append(track)
-    await ctx.send(
-        f"➕ Added **{discord.utils.escape_markdown(track.title)}** "
-        f"(`{format_duration(track.duration)}`) to the queue. Position: "
-        f"{len(get_queue(guild_id))}"
-    )
+    queue_position = len(get_queue(guild_id))
+    if status_message is not None:
+        await _set_music_status(
+            ctx,
+            status_message,
+            "✅ TRACK QUEUED",
+            f"`◈ QUEUED`  `◷ {format_duration(track.duration)}`  `▣ POSITION {queue_position}`\n"
+            f"{MUSIC_BAR}\n\n"
+            f"**{discord.utils.escape_markdown(track.title)}**",
+            color=MUSIC_COLOR.value,
+        )
+    else:
+        await ctx.send(embed=_music_status_embed(
+            "➕ TRACK QUEUED",
+            f"`◈ QUEUED`  `◷ {format_duration(track.duration)}`  `▣ POSITION {queue_position}`\n"
+            f"{MUSIC_BAR}\n\n"
+            f"**{discord.utils.escape_markdown(track.title)}**",
+        ))
     voice = ctx.guild.voice_client
     if voice and not voice.is_playing() and not voice.is_paused():
         await play_next(ctx)
@@ -644,17 +878,48 @@ def _save_juicewrld_state() -> None:
     temporary_path.replace(JUICEWRLD_STATE_FILE)
 
 
-async def _juicewrld_api_get(path: str, params: Optional[dict] = None):
-    timeout = aiohttp.ClientTimeout(total=20)
+async def _juicewrld_api_get(
+    path: str,
+    params: Optional[dict] = None,
+    *,
+    timeout_seconds: int = 60,
+    retries: int = 3,
+):
+    """Call the Juice WRLD API with configurable timeouts and transient-error retries."""
+    timeout_seconds = max(3, int(timeout_seconds))
+    retries = max(1, int(retries))
+    timeout = aiohttp.ClientTimeout(
+        total=timeout_seconds,
+        sock_connect=min(20, timeout_seconds),
+        sock_read=min(40, timeout_seconds),
+    )
     headers = {"Accept": "application/json"}
     if JUICEWRLD_API_KEY:
         headers["X-API-Key"] = JUICEWRLD_API_KEY
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        async with session.get(
-            f"{JUICEWRLD_API_BASE}/{path.lstrip('/')}", params=params
-        ) as response:
-            response.raise_for_status()
-            return await response.json(content_type=None)
+
+    last_error = None
+    for attempt in range(retries):
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(
+                    f"{JUICEWRLD_API_BASE}/{path.lstrip('/')}", params=params
+                ) as response:
+                    response.raise_for_status()
+                    return await response.json(content_type=None)
+        except aiohttp.ClientResponseError as exc:
+            # Retry server-side errors, but don't keep retrying invalid requests/auth failures.
+            if exc.status < 500:
+                raise
+            last_error = exc
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            last_error = exc
+
+        if attempt < retries - 1:
+            await asyncio.sleep(0.75 * (attempt + 1))
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("Juice WRLD API request failed without returning a response.")
 
 
 def _juicewrld_items(payload):
@@ -976,7 +1241,7 @@ HELP_PAGES: list[dict] = [
                 "Pause the current song and pick it back up right where you left off.",
             ),
             (
-                f"`{PREFIX}volume <0-100>`  •  `{PREFIX}vol`",
+                f"`{PREFIX}volume <0-{MAX_VOLUME_PERCENT}>`  •  `{PREFIX}vol`",
                 "Sets the playback volume for this server. "
                 f"The default is {int(DEFAULT_VOLUME * 100)}%. "
                 "The change applies instantly, even mid-song.",
@@ -1001,16 +1266,27 @@ HELP_PAGES: list[dict] = [
     },
     {
         "key": "juice",
-        "aliases": ("jw", "jwsong", "tracker", "juicewrld"),
+        "aliases": ("jw", "jwplay", "jwradio", "jwsong", "tracker", "juicewrld"),
         "emoji": "🧃",
         "title": "Juice WRLD Tools",
-        "summary": "Catalog search and automatic tracker updates",
+        "summary": "Catalog search, shared-queue playback, and tracker updates",
         "color": JUICE_COLOR,
         "description": (
-            "Catalog features powered by the Juice WRLD API. Information only — "
-            "these tools don't play audio."
+            "Catalog tools powered by the Juice WRLD API. `~jwplay` queues tracks in the shared player; "
+            "`~jwradio` continuously plays random tracks and blocks manual play commands until disabled."
         ),
         "fields": [
+            (
+                f"`{PREFIX}jwplay` / `{PREFIX}jwp` (random) or `{PREFIX}jwplay <song>`",
+                "Searches for a Juice WRLD catalog match and queues its available audio in the same queue as "
+                f"`{PREFIX}play`. It will not interrupt a song already playing.\n"
+                f"Example: `{PREFIX}jwplay lucid dreams`",
+            ),
+            (
+                f"`{PREFIX}jwradio` / `{PREFIX}jwradio off`",
+                "Continuously queues random Juice WRLD tracks. While radio is active, `~play` and `~jwplay` "
+                "are blocked; disable radio with `~jwradio off` or use `~stop` / `~leave` to stop/disconnect.",
+            ),
             (
                 f"`{PREFIX}jwsong <search>`",
                 "Searches the Juice WRLD catalog, opens a detailed song embed, "
@@ -1941,24 +2217,37 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
     """Play a song name, supported URL, or attached MP3/WAV/Opus file."""
     if not ctx.guild:
         return await ctx.send("Use this command inside a server.")
+    if ctx.guild.id in jw_radio_active:
+        return await ctx.send(
+            f"📻 **Juice WRLD Radio is active** in this server. Disable it with `~jwradio off` "
+            "before using `~play`, or use `~stop` / `~leave` to stop the radio and disconnect me."
+        )
     diag(f"~play received: {query[:80]!r}")
     if not query.strip() and not ctx.message.attachments:
         return await ctx.send(
             f"Usage: `{PREFIX}play song name or URL` — or attach an audio file to `{PREFIX}play`."
         )
+    requested_label = query.strip() or (ctx.message.attachments[0].filename if ctx.message.attachments else "attached audio")
+    status_message = await ctx.send(embed=_music_status_embed(
+        "🔎 Looking for your song…",
+        f"`◎ SEARCHING`  `⬡ SOURCES`\n{MUSIC_BAR}\n\n"
+        f"Request: **{discord.utils.escape_markdown(requested_label[:180])}**\n"
+        "Checking the source and preparing audio.",
+    ))
     try:
         await ensure_voice(ctx)
     except Exception as exc:
-        return await ctx.send(str(exc))
+        await _set_music_status(ctx, status_message, "⚠️ Couldn't start playback", str(exc), color=discord.Color.orange().value)
+        return
     diag("joined voice, continuing")
 
     attachment = ctx.message.attachments[0] if ctx.message.attachments else None
     if attachment:
         suffix = Path(urlparse(attachment.filename).path).suffix.lower()
         if suffix not in ALLOWED_UPLOAD_SUFFIXES:
-            return await ctx.send("Attach an MP3, WAV, Opus, OGG, M4A, or FLAC audio file.")
+            return await _set_music_status(ctx, status_message, "❌ Unsupported audio file", "Attach an MP3, WAV, Opus, OGG, M4A, or FLAC audio file.", color=discord.Color.red().value)
         if attachment.size > MAX_UPLOAD_MB * 1024 * 1024:
-            return await ctx.send(f"That file is over the bot's {MAX_UPLOAD_MB} MB safety limit.")
+            return await _set_music_status(ctx, status_message, "❌ File is too large", f"That file is over the bot's {MAX_UPLOAD_MB} MB safety limit.", color=discord.Color.red().value)
         if not query:
             query = attachment.filename
         try:
@@ -1973,10 +2262,10 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
                 local_path=path,
                 source_name="uploaded file",
             )
-            await queue_track(ctx, track)
+            await queue_track(ctx, track, status_message=status_message)
         except Exception as exc:
             clean_temp_file(locals().get("path"))
-            await ctx.send(f"Couldn't save that upload: {exc}")
+            await _set_music_status(ctx, status_message, "❌ Couldn't save that upload", str(exc), color=discord.Color.red().value)
         return
 
     if not query.strip():
@@ -1987,10 +2276,19 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
     # Spotify and Apple Music links may provide metadata or a playable match,
     # but direct catalog audio streaming is not guaranteed or bypassed here.
     await ctx.typing()
+
+    async def _on_play_found(found_title: str) -> None:
+        await _set_music_status(
+            ctx, status_message, "✅ MATCH FOUND  //  PREPARING AUDIO",
+            f"`◈ MATCH`  `⬡ DOWNLOADING`\n{MUSIC_BAR}\n\n"
+            f"**{discord.utils.escape_markdown(found_title[:180])}**\nDownloading audio and adding it to the shared queue…",
+            color=MUSIC_COLOR.value,
+        )
+
     try:
-        track = await extract_track(query.strip(), ctx.author.display_name)
+        track = await extract_track(query.strip(), ctx.author.display_name, on_found=_on_play_found)
         diag(f"track ready: {track.title!r}, queueing")
-        await queue_track(ctx, track)
+        await queue_track(ctx, track, status_message=status_message)
     except Exception as exc:
         error_text = str(exc)
         print(f"yt-dlp error: {error_text}", flush=True)
@@ -2000,18 +2298,17 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
             or "sign in to confirm" in lower_error
             or "login required" in lower_error
         ):
-            await ctx.send(
-                "⚠️ YouTube requires sign-in for this request. VaultBot is configured "
-                "to try alternate public YouTube clients without cookies, but YouTube "
-                "can still block particular tracks or this host. Try a different "
-                "public YouTube URL or a SoundCloud link."
+            await _set_music_status(
+                ctx, status_message, "⚠️ Source requires sign-in",
+                "YouTube blocked this request. Try a different public YouTube URL or a SoundCloud link.",
+                color=discord.Color.orange().value,
             )
         else:
-            await ctx.send(
-                "I couldn't find a playable stream for that request. "
-                "For Spotify/Apple Music, direct playback may not be available; "
-                "try a public YouTube/SoundCloud URL or a song title.\n"
-                f"Details: {error_text[:250]}"
+            await _set_music_status(
+                ctx, status_message, "❌ Couldn't find playable audio",
+                "Try a public YouTube/SoundCloud URL or a song title.\n"
+                f"Details: {error_text[:250]}",
+                color=discord.Color.red().value,
             )
 
 
@@ -2022,10 +2319,13 @@ async def queue_command(ctx: commands.Context):
     guild_id = ctx.guild.id
     tracks = list(get_queue(guild_id))
     current = current_tracks.get(guild_id)
-    embed = discord.Embed(title="🎵 Music Queue", color=BRAND_COLOR)
+    embed = discord.Embed(title="◈  AUDIO QUEUE", color=MUSIC_COLOR)
+    embed.set_author(name=MUSIC_AUTHOR)
+    embed.description = f"`◈ QUEUE`  `▣ {len(tracks)} TRACK{'S' if len(tracks) != 1 else ''}`\n{MUSIC_BAR}"
+    footer = MUSIC_FOOTER
     if current:
         embed.add_field(
-            name="Now playing",
+            name="▸  NOW PLAYING",
             value=f"[{discord.utils.escape_markdown(current.title)}]({current.webpage_url})",
             inline=False,
         )
@@ -2035,12 +2335,13 @@ async def queue_command(ctx: commands.Context):
             f"— `{format_duration(t.duration)}`"
             for i, t in enumerate(tracks[:10], start=1)
         ]
-        embed.add_field(name=f"Up next ({len(tracks)} queued)", value="\n".join(lines), inline=False)
+        embed.add_field(name=f"▸  UP NEXT  ({len(tracks)} QUEUED)", value="\n".join(lines), inline=False)
         if len(tracks) > 10:
-            embed.set_footer(text=f"And {len(tracks) - 10} more track(s)")
+            footer = f"{MUSIC_FOOTER}  •  +{len(tracks) - 10} more"
     elif not current:
-        embed.description = "The queue is empty."
-    embed.add_field(name="Loop mode", value=loop_modes.get(guild_id, "off"), inline=True)
+        embed.description += "\n\nThe queue is empty."
+    embed.add_field(name="▣  LOOP", value=f"`{str(loop_modes.get(guild_id, 'off')).upper()}`", inline=True)
+    embed.set_footer(text=footer)
     await ctx.send(embed=embed)
 
 
@@ -2058,8 +2359,11 @@ async def skip_command(ctx: commands.Context):
 async def stop_command(ctx: commands.Context):
     if not ctx.guild:
         return
+    guild_id = ctx.guild.id
+    jw_radio_active.discard(guild_id)
+    jw_radio_starting.discard(guild_id)
     voice = ctx.guild.voice_client
-    get_queue(ctx.guild.id).clear()
+    get_queue(guild_id).clear()
     loop_modes[ctx.guild.id] = "off"
     current = current_tracks.pop(ctx.guild.id, None)
     if current:
@@ -2095,13 +2399,14 @@ async def resume_command(ctx: commands.Context):
 async def volume_command(ctx: commands.Context, percent: int):
     if not ctx.guild:
         return
-    if not 0 <= percent <= 100:
-        return await ctx.send("Choose a volume from 0 to 100.")
+    if not 0 <= percent <= MAX_VOLUME_PERCENT:
+        return await ctx.send(f"Choose a volume from 0 to {MAX_VOLUME_PERCENT}.")
     volumes[ctx.guild.id] = percent / 100
     voice = ctx.guild.voice_client
     if voice and voice.source and isinstance(voice.source, discord.PCMVolumeTransformer):
         voice.source.volume = percent / 100
-    await ctx.send(f"🔊 Volume set to **{percent}%**.")
+    note = " Above 100% is amplified and may sound distorted." if percent > 100 else ""
+    await ctx.send(f"🔊 Volume set to **{percent}%**.{note}")
 
 
 @bot.command(name="nowplaying", aliases=["np", "current"])
@@ -2129,6 +2434,8 @@ async def leave_command(ctx: commands.Context):
     if not ctx.guild or not ctx.guild.voice_client:
         return await ctx.send("I'm not connected to a voice channel.")
     guild_id = ctx.guild.id
+    jw_radio_active.discard(guild_id)
+    jw_radio_starting.discard(guild_id)
     voice = ctx.guild.voice_client
     get_queue(guild_id).clear()
     loop_modes[guild_id] = "off"
@@ -2139,6 +2446,60 @@ async def leave_command(ctx: commands.Context):
         voice.stop()
     await voice.disconnect()
     await ctx.send("👋 Disconnected from voice.")
+
+
+# ---- Leave empty voice channels (stops streaming audio to nobody) ----
+_voice_idle_tasks: dict = {}
+
+
+def _humans_in_channel(channel) -> int:
+    return sum(1 for member in getattr(channel, "members", []) if not member.bot)
+
+
+async def _leave_when_empty(guild_id: int) -> None:
+    try:
+        await asyncio.sleep(VOICE_IDLE_LEAVE_SECONDS)
+        guild = bot.get_guild(guild_id)
+        voice = guild.voice_client if guild else None
+        if not voice or not voice.channel or _humans_in_channel(voice.channel) > 0:
+            return
+        # Same cleanup as ~leave.
+        jw_radio_active.discard(guild_id)
+        jw_radio_starting.discard(guild_id)
+        get_queue(guild_id).clear()
+        loop_modes[guild_id] = "off"
+        current = current_tracks.pop(guild_id, None)
+        if current:
+            clean_temp_file(current.local_path)
+        if voice.is_playing() or voice.is_paused():
+            voice.stop()
+        await voice.disconnect()
+        print(f"[Voice] Left {guild.name!r}: nobody listening for {VOICE_IDLE_LEAVE_SECONDS}s (saves data).", flush=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        print(f"[Voice] Auto-leave failed: {type(exc).__name__}: {exc}", flush=True)
+    finally:
+        if _voice_idle_tasks.get(guild_id) is asyncio.current_task():
+            _voice_idle_tasks.pop(guild_id, None)
+
+
+@bot.listen("on_voice_state_update")
+async def _voice_idle_watch(member, before, after):
+    if VOICE_IDLE_LEAVE_SECONDS <= 0:
+        return
+    guild = member.guild
+    voice = guild.voice_client
+    if not voice or not voice.channel:
+        return
+    task = _voice_idle_tasks.get(guild.id)
+    if _humans_in_channel(voice.channel) > 0:
+        if task and not task.done():
+            task.cancel()
+        _voice_idle_tasks.pop(guild.id, None)
+        return
+    if task is None or task.done():
+        _voice_idle_tasks[guild.id] = asyncio.create_task(_leave_when_empty(guild.id))
 
 
 # ---- Juice WRLD ----
@@ -2296,6 +2657,104 @@ def _jw_file_is_directory(item):
     return str(item.get("type", "")).casefold() in {"directory", "dir", "folder"}
 
 
+def _jw_is_beat_or_instrumental(path, item=None) -> bool:
+    """Return True for obvious beat/instrumental uploads, not full songs."""
+    item = item if isinstance(item, dict) else {}
+    if any(item.get(key) is True for key in ("is_instrumental", "instrumental", "is_beat", "beat_only")):
+        return True
+
+    metadata = " ".join(
+        str(item.get(key, ""))
+        for key in ("type", "category", "kind", "title", "name", "description", "tags")
+    ).casefold()
+    normalized_path = str(path or "").replace("\\", "/").casefold()
+    full_text = f"{normalized_path} {metadata}"
+
+    # Directory names are strong signals; this also catches the API's
+    # Instrumentals/<album>/<track>/... structure shown in its file listing.
+    parts = [part.strip() for part in normalized_path.split("/") if part.strip()]
+    blocked_folders = {
+        "instrumental", "instrumentals", "beats", "beat", "type beats",
+        "type-beats", "typebeats", "beat instrumentals", "instrumental beats",
+    }
+    if any(part in blocked_folders for part in parts[:-1]):
+        return True
+
+    # Catch common beat filenames such as "NM - Komodo 140BPM.wav" while
+    # avoiding a blanket substring match on ordinary song titles.
+    beat_patterns = (
+        r"\binstrumentals?\b", r"\btype[ _-]?beats?\b",
+        r"\bbeat[ _-]?only\b", r"\bprod(?:uced)?[ _-]?by\b",
+        r"\b\d{2,3}\s*bpm\b", r"\b(?:drumless|loop kit|beat pack)\b",
+    )
+    if any(re.search(pattern, full_text) for pattern in beat_patterns):
+        return True
+
+    # A standalone "beat" or "beats" in a filename/title is a useful clue,
+    # but don't block unrelated titles just because they contain the letters.
+    stem = Path(parts[-1]).stem if parts else str(path or "")
+    if re.search(r"(?:^|[ _-])(?:beat|beats)(?:$|[ _-])", stem.casefold()):
+        return True
+    return False
+
+
+def _jw_is_fanmade_or_altered(path, item=None) -> bool:
+    """Filter mixes/remixes plus obvious unofficial covers, mashups, and edited uploads.
+
+    The API does not reliably expose rights/official-status metadata, so this is
+    deliberately a conservative filename, folder, and metadata heuristic.
+    """
+    item = item if isinstance(item, dict) else {}
+    for key in ("is_remix", "is_cover", "is_mashup", "is_fanmade", "fan_made",
+                "is_unofficial", "is_ai_cover", "is_edit", "is_sped_up", "is_slowed"):
+        if item.get(key) is True:
+            return True
+
+    normalized_path = str(path or "").replace("\\", "/").casefold()
+    metadata = " ".join(
+        str(item.get(key, ""))
+        for key in ("type", "category", "kind", "title", "name", "description", "tags", "artist", "album")
+    ).casefold()
+    full_text = f"{normalized_path} {metadata}"
+
+    # A folder explicitly dedicated to alternate/community edits is a strong signal.
+    blocked_folders = {
+        "mix", "mixes", "remix", "remixes", "remixs", "fan remixes",
+        "fanmade remixes", "fan-made remixes", "mashup", "mashups", "covers",
+        "cover versions", "edits", "fan edits", "unofficial", "bootlegs", "bootleg",
+        "ai covers", "ai generated", "sped up", "slowed", "slowed reverb",
+        "nightcore", "8d audio",
+    }
+    parts = [part.strip() for part in normalized_path.split("/") if part.strip()]
+    if any(part in blocked_folders for part in parts[:-1]):
+        return True
+
+    # Word-boundary patterns avoid matching incidental substrings in normal titles.
+    altered_patterns = (
+        # Exclude any title/path/metadata explicitly labelled mix or remix,
+        # including plural and common misspelled forms.
+        r"\b(?:re)?mix(?:es|s|ed)?\b",
+        r"\b(?:fan[ -]?made|fanmade|unofficial)\b",
+        r"\bmash[ -]?up\b", r"\bbootleg\b", r"\bcover(?: version)?\b",
+        r"\b(?:sped[ -]?up|speed[ -]?up|slowed(?:[ -]?down)?|slowed[ -]?reverb)\b",
+        r"\bnightcore\b", r"\b8d(?:[ -]?audio)?\b",
+        r"\bchopped[ -]?and[ -]?screwed\b", r"\b(?:reverb edit|fan edit|edit audio)\b",
+        r"\b(?:ai cover|ai voice|ai generated|artificial intelligence cover)\b",
+        r"\b(?:reimagined|flip|flip version|remake)\b",
+    )
+    return any(re.search(pattern, full_text) for pattern in altered_patterns)
+
+
+def _jw_radio_title_key(title: str) -> str:
+    """Normalize a file title so alternate versions of the same song compare equal."""
+    title = Path(str(title or "")).stem
+    # Ignore common version notes and featured-artist notes, which often differ
+    # between uploads even when the underlying song title is the same.
+    title = re.sub(r"\s*[\[(][^\])]*(?:version|ver\.?|demo|remaster|remastered|mix|edit|v\d+|feat\.?|ft\.?)[^\])]*[\])]\s*", " ", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s*[-–—_]\s*(?:v\d+|version\s*\d+|demo|remaster(?:ed)?|alternate mix)\s*$", " ", title, flags=re.IGNORECASE)
+    return "".join(char.casefold() for char in title if char.isalnum())
+
+
 def _jw_audio_candidates(items, query, limit=25):
     """Filter API file-list entries to likely matching audio files."""
     suffixes = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus", ".aac"}
@@ -2307,6 +2766,8 @@ def _jw_audio_candidates(items, query, limit=25):
             continue
         path = _jw_file_path(item)
         if not path or Path(path).suffix.casefold() not in suffixes:
+            continue
+        if _jw_is_beat_or_instrumental(path, item) or _jw_is_fanmade_or_altered(path, item):
             continue
         normalized = "".join(ch.casefold() for ch in Path(path).stem if ch.isalnum())
         if q and q not in normalized and normalized not in q:
@@ -3276,11 +3737,106 @@ async def juicewrld_lyrics_search(ctx: commands.Context, *, phrase: str):
         await ctx.send("The Juice WRLD catalog is unavailable right now. Please try lyric search again later.")
 
 
+# --- Cover-art helpers -------------------------------------------------------
+# Discord has to fetch embed images itself, and many hosts block, rate-limit or
+# slowly serve Discord's image proxy, which leaves a blank embed. VaultBot now
+# downloads each cover first and uploads it as an attachment, then falls back to
+# the direct URL, then to a plain link, so a result is never silently blank.
+_JW_IMG_EXT = {
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/png": "png",
+    "image/gif": "gif",
+    "image/webp": "webp",
+}
+_JW_IMG_MAGIC = (
+    (b"\xff\xd8\xff", "jpg"),
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"GIF87a", "gif"),
+    (b"GIF89a", "gif"),
+)
+
+
+def _jw_clean_url(url: str) -> str:
+    """Percent-encode a URL's path safely (spaces, #, non-ASCII...) without double-encoding.
+
+    A raw '#' in an image URL from the API is treated as part of the filename (a fragment is
+    meaningless for an image fetch), so it becomes %23 instead of silently cutting the URL short.
+    """
+    url = (url or "").strip()
+    match = re.match(r"^(https?://[^/?#]+)(.*)$", url, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return url.replace(" ", "%20")
+    host, rest = match.groups()
+    path, sep, query = rest.partition("?")
+    path = quote(path, safe="/%:@+,;=~!$&'()*")
+    query = quote(query, safe="=&%:@+,;/?~!$'()*")
+    return host + path + (sep + query if sep else "")
+
+
+def _jw_sniff_image_ext(data: bytes) -> Optional[str]:
+    """Identify the image type from its bytes, so a wrong Content-Type header doesn't matter."""
+    for magic, ext in _JW_IMG_MAGIC:
+        if data.startswith(magic):
+            return ext
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+async def _jw_download_image(session: aiohttp.ClientSession, url: str, max_bytes: int = 8_000_000):
+    """Download one image. Returns (bytes, extension) or None; failures are logged, never raised."""
+    try:
+        async with session.get(_jw_clean_url(url), allow_redirects=True) as resp:
+            if resp.status != 200:
+                print(f"[jwcover] HTTP {resp.status} for {url}", flush=True)
+                return None
+            # Read the WHOLE body in chunks (StreamReader.read(n) can return a partial chunk,
+            # which produced truncated, half-grey images).
+            chunks, total = [], 0
+            async for chunk in resp.content.iter_chunked(65536):
+                total += len(chunk)
+                if total > max_bytes:
+                    print(f"[jwcover] too large (> {max_bytes} bytes): {url}", flush=True)
+                    return None
+                chunks.append(chunk)
+            data = b"".join(chunks)
+            expected = resp.content_length
+            if expected is not None and not resp.headers.get("Content-Encoding") and len(data) != expected:
+                print(f"[jwcover] incomplete download ({len(data)}/{expected} bytes): {url}", flush=True)
+                return None
+            if not data:
+                print(f"[jwcover] empty response: {url}", flush=True)
+                return None
+            ctype = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+            ext = _jw_sniff_image_ext(data) or _JW_IMG_EXT.get(ctype)
+            if not ext:
+                print(f"[jwcover] not an image (content-type {ctype!r}): {url}", flush=True)
+                return None
+            return data, ext
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+        print(f"[jwcover] download failed for {url}: {type(exc).__name__}: {exc}", flush=True)
+        return None
+
+
+async def _jw_download_images(urls: list):
+    """Download many images concurrently (max 4 at a time)."""
+    sem = asyncio.Semaphore(4)
+    timeout = aiohttp.ClientTimeout(total=25)
+    headers = {"User-Agent": "VaultBot/1.0 (Juice WRLD lookup)", "Accept": "image/*,*/*;q=0.8"}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async def one(url):
+            async with sem:
+                return await _jw_download_image(session, url)
+        return await asyncio.gather(*(one(u) for u in urls))
+
+
 @bot.command(name="jwcover")
 @commands.cooldown(1, 8, commands.BucketType.user)
 async def juicewrld_cover(ctx: commands.Context, *, query: str):
     """Search community cover art and display every result directly in Discord."""
     try:
+        await ctx.typing()
         payload = await _jw_get_json_url("https://wrld.pure0.lol/api/covers/", params={"search": query})
         images = payload.get("images", []) if isinstance(payload, dict) else []
         urls, seen = [], set()
@@ -3289,11 +3845,12 @@ async def juicewrld_cover(ctx: commands.Context, *, query: str):
                 image = image.get("url") or image.get("image") or image.get("src")
             if not isinstance(image, str) or not image.strip():
                 continue
-            image = image.strip().replace(" ", "%20")
+            image = image.strip()
             if image.startswith("/"):
                 image = "https://wrld.pure0.lol" + image
             if not image.startswith(("https://", "http://")):
                 continue
+            image = _jw_clean_url(image)
             if image.lower() not in seen:
                 urls.append(image)
                 seen.add(image.lower())
@@ -3302,16 +3859,47 @@ async def juicewrld_cover(ctx: commands.Context, *, query: str):
         if not urls:
             return await ctx.send(f"No cover art found for **{discord.utils.escape_markdown(query[:100])}**. The cover service may also be unavailable.")
 
-        # Discord allows up to 10 embeds per message. Give each cover its own image
-        # embed, so users can see the results in chat rather than opening each link.
         await ctx.send(f"🎨 Found **{len(urls)}** cover image(s) for **{discord.utils.escape_markdown(query[:100])}**:")
-        for offset in range(0, len(urls), 10):
-            embeds = []
-            for index, url in enumerate(urls[offset:offset + 10], start=offset + 1):
-                embed = discord.Embed(title=f"Cover art: {query[:150]} · {index}/{len(urls)}", color=JUICE_COLOR)
-                embed.set_image(url=url)
+        results = await _jw_download_images(urls)
+
+        # Group results into messages: max 10 embeds and under the server's upload limit.
+        guild_limit = getattr(ctx.guild, "filesize_limit", None) if ctx.guild else None
+        budget = max(1_000_000, (guild_limit or 10_000_000) - 500_000)
+        batches, current, current_size = [], [], 0
+        for index, (url, result) in enumerate(zip(urls, results), start=1):
+            size = len(result[0]) if result else 0
+            if current and (len(current) >= 10 or current_size + size > budget):
+                batches.append(current)
+                current, current_size = [], 0
+            current.append((index, url, result))
+            current_size += size
+        if current:
+            batches.append(current)
+
+        for batch in batches:
+            embeds, files, fallback_embeds = [], [], []
+            for index, url, result in batch:
+                title = f"Cover art: {query[:150]} · {index}/{len(urls)}"
+                embed = discord.Embed(title=title, color=JUICE_COLOR)
+                direct = discord.Embed(title=title, color=JUICE_COLOR)
+                direct.set_image(url=url)
+                fallback_embeds.append(direct)
+                if result:
+                    data, ext = result
+                    filename = f"cover_{index}.{ext}"
+                    files.append(discord.File(io.BytesIO(data), filename=filename))
+                    embed.set_image(url=f"attachment://{filename}")
+                else:
+                    # Couldn't download it ourselves: try the direct URL and give a clickable link too.
+                    embed.set_image(url=url)
+                    embed.description = f"[Open image]({url})"
                 embeds.append(embed)
-            await ctx.send(embeds=embeds)
+            try:
+                await ctx.send(embeds=embeds, files=files)
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                # e.g. missing Attach Files permission or upload too large -> fall back to plain URL embeds.
+                print(f"[jwcover] attachment send failed ({type(exc).__name__}: {exc}); using direct URLs", flush=True)
+                await ctx.send(embeds=fallback_embeds)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
         print(f"[JuiceWRLD] Cover lookup failed: {type(exc).__name__}: {exc}")
         await ctx.send("The cover-art service is unavailable right now. Please try again later.")
@@ -3346,6 +3934,613 @@ async def juicewrld_files(ctx: commands.Context, *, query: str):
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
         print(f"[JuiceWRLD] File search failed: {type(exc).__name__}: {exc}")
         await ctx.send("The Juice WRLD file browser is unavailable right now. Please try again later.")
+
+
+def _jw_parse_duration(song: dict) -> Optional[int]:
+    """Read a numeric duration or a MM:SS / HH:MM:SS catalog length."""
+    for key in ("duration_seconds", "duration", "length"):
+        value = song.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            return int(value)
+        if isinstance(value, str) and value.strip():
+            raw = value.strip()
+            if raw.isdigit():
+                seconds = int(raw)
+                if seconds > 0:
+                    return seconds
+            if re.fullmatch(r"\d{1,3}:\d{1,2}(?::\d{1,2})?", raw):
+                try:
+                    parts = [int(part) for part in raw.split(":")]
+                    total = 0
+                    for part in parts:
+                        total = total * 60 + part
+                    if total > 0:
+                        return total
+                except ValueError:
+                    pass
+    return None
+
+
+async def _download_juicewrld_track(
+    song: dict, requester: str, *, radio_fast: bool = False
+) -> Track:
+    """Download an API audio file; radio mode favors quick skips over long stalls."""
+    raw_path = song.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ValueError("This catalog result does not have a downloadable audio path.")
+
+    remote_path = raw_path.strip().replace("\\", "/")
+    if remote_path.startswith(("http://", "https://")) or ".." in remote_path.split("/"):
+        raise ValueError("The API returned an invalid audio path.")
+
+    original_suffix = Path(remote_path).suffix.lower()
+    if original_suffix not in {".mp3", ".wav", ".opus", ".ogg", ".m4a", ".flac", ".aac", ".mp4"}:
+        original_suffix = ".mp3"
+
+    # Try the API's smaller compressed MP3 endpoint first (large WAV files can
+    # be slow to serve), then ALWAYS fall back to the documented original-file
+    # stream endpoint. The API may reject transcoding with HTTP 406 for files
+    # that it can still serve normally; radio must not give up on those tracks.
+    attempts = [
+        ("files/download-compressed/", {"path": remote_path, "bitrate": JW_PLAYBACK_BITRATE}, ".mp3"),
+        ("files/download/", {"path": remote_path}, original_suffix),
+    ]
+    headers = {"Accept": "audio/*, application/octet-stream"}
+    if JUICEWRLD_API_KEY:
+        headers["X-API-Key"] = JUICEWRLD_API_KEY
+
+    max_bytes = (JW_RADIO_MAX_MB if radio_fast else 200) * 1024 * 1024
+    last_error = None
+    for endpoint, params, suffix in attempts:
+        endpoint_attempts = 1 if radio_fast else 3
+        for attempt in range(endpoint_attempts):
+            folder = Path(tempfile.mkdtemp(prefix="vaultbot_audio_"))
+            local_path = folder / f"juicewrld{suffix}"
+            total_bytes = 0
+            # Radio uses a short per-candidate budget and moves on quickly;
+            # manual requests retain the longer timeout and retries.
+            timeout = (
+                aiohttp.ClientTimeout(total=35, sock_connect=10, sock_read=25)
+                if radio_fast
+                else aiohttp.ClientTimeout(total=360, sock_connect=60, sock_read=90)
+            )
+            try:
+                async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                    async with session.get(
+                        f"{JUICEWRLD_API_BASE}/{endpoint}", params=params
+                    ) as response:
+                        response.raise_for_status()
+                        content_type = response.headers.get("Content-Type", "").lower()
+                        if "application/json" in content_type or "text/html" in content_type:
+                            detail = (await response.text())[:180]
+                            raise ValueError(f"The API did not return audio data. {detail}")
+                        declared = response.content_length
+                        if declared and declared > max_bytes:
+                            # Refuse before downloading anything, so oversized files cost no data.
+                            raise ValueError(
+                                f"File is {declared // (1024 * 1024)} MB, over the {max_bytes // (1024 * 1024)} MB limit."
+                            )
+                        with local_path.open("wb") as output:
+                            async for chunk in response.content.iter_chunked(128 * 1024):
+                                if not chunk:
+                                    continue
+                                total_bytes += len(chunk)
+                                if total_bytes > max_bytes:
+                                    raise ValueError(f"The audio file exceeds VaultBot's {max_bytes // (1024 * 1024)} MB limit.")
+                                output.write(chunk)
+                if total_bytes == 0:
+                    raise ValueError("The API returned an empty audio file.")
+
+                title = str(song.get("name") or song.get("title") or Path(remote_path).stem or "Juice WRLD track")
+                song_id = song.get("id")
+                webpage_url = (
+                    f"{JUICEWRLD_API_BASE}/songs/{int(song_id)}/"
+                    if song_id is not None and str(song_id).isdigit()
+                    else "https://juicewrldapi.com/"
+                )
+                path_text = str(local_path)
+                TEMP_FILES.add(path_text)
+                return Track(
+                    title=title,
+                    webpage_url=webpage_url,
+                    requester=requester,
+                    local_path=path_text,
+                    duration=_jw_parse_duration(song),
+                    source_name="Juice WRLD API",
+                )
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                last_error = exc
+                print(
+                    f"[JuiceWRLD Audio] Endpoint {endpoint} failed for {remote_path!r}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                shutil.rmtree(folder, ignore_errors=True)
+                if attempt < endpoint_attempts - 1:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+            except Exception as exc:
+                shutil.rmtree(folder, ignore_errors=True)
+                # Invalid/non-audio response: move on to the next endpoint.
+                last_error = exc
+                print(
+                    f"[JuiceWRLD Audio] Endpoint {endpoint} returned unusable data "
+                    f"for {remote_path!r}: {type(exc).__name__}: {exc}"
+                )
+                break
+    if last_error:
+        raise last_error
+    raise ValueError("The Juice WRLD API could not provide playable audio.")
+
+
+# Catalog caches: in-memory for same-process radio rotations and JSON on disk
+# so a restarted bot can usually pick a track without waiting for list-all again.
+_jw_radio_catalog_cache: list[tuple[str, dict]] = []
+_jw_radio_catalog_cache_at = 0.0
+_jw_radio_catalog_cache_loaded = False
+_jw_radio_catalog_lock = asyncio.Lock()
+_JW_RADIO_CATALOG_TTL_SECONDS = 6 * 60 * 60
+
+
+def _load_jw_radio_catalog_disk_cache() -> None:
+    """Load the last known playable file list; a stale cache is better than a hang."""
+    global _jw_radio_catalog_cache, _jw_radio_catalog_cache_at, _jw_radio_catalog_cache_loaded
+    if _jw_radio_catalog_cache_loaded:
+        return
+    _jw_radio_catalog_cache_loaded = True
+    try:
+        cached = json.loads(JUICEWRLD_CATALOG_CACHE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(cached, dict) or not isinstance(cached.get("files"), list):
+            return
+        files = []
+        for row in cached["files"]:
+            if not isinstance(row, dict) or not isinstance(row.get("path"), str):
+                continue
+            info = row.get("info") if isinstance(row.get("info"), dict) else {}
+            files.append((row["path"], info))
+        if files:
+            _jw_radio_catalog_cache = files
+            _jw_radio_catalog_cache_at = float(cached.get("cached_at", 0) or 0)
+            age = max(0, int(time.time() - _jw_radio_catalog_cache_at))
+            print(f"[JuiceWRLD Radio] Loaded {len(files)} cached audio file(s) (cache age {age}s).")
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        print(f"[JuiceWRLD Radio] Could not read catalog cache: {type(exc).__name__}: {exc}")
+
+
+async def _refresh_jw_radio_catalog(progress_callback=None) -> list[tuple[str, dict]]:
+    """Fetch and persist the playable-file list with retry windows suited to the large API listing."""
+    global _jw_radio_catalog_cache, _jw_radio_catalog_cache_at
+    async with _jw_radio_catalog_lock:
+        # Another concurrent caller may have refreshed it while this task waited.
+        if _jw_radio_catalog_cache and time.time() - _jw_radio_catalog_cache_at < _JW_RADIO_CATALOG_TTL_SECONDS:
+            return _jw_radio_catalog_cache
+
+        last_error = None
+        audio_files = []
+        # /files/list-all/ can be a very large response, so a 15-second timeout
+        # was too aggressive and caused radio to fail before receiving any rows.
+        # The browse endpoint remains a quicker fallback if the flat listing stalls.
+        endpoints = (
+            ("/files/list-all/", 55, 2),
+            ("/files/browse/", 30, 2),
+        )
+        for endpoint, timeout_seconds, retries in endpoints:
+            try:
+                if progress_callback is not None:
+                    try:
+                        await progress_callback(
+                            "📡 Loading Juice WRLD catalog…",
+                            f"Requesting `{endpoint}` (up to {retries} attempts, {timeout_seconds}s per attempt). The full catalog can take longer than a normal API lookup.",
+                        )
+                    except Exception:
+                        pass
+                payload = await _juicewrld_api_get(
+                    endpoint, timeout_seconds=timeout_seconds, retries=retries
+                )
+                entries = _juicewrld_items(payload)
+                audio_files = _jw_audio_candidates(entries, query="", limit=10000)
+                if audio_files:
+                    print(f"[JuiceWRLD Radio] Catalog loaded from {endpoint}: {len(audio_files)} playable candidate(s).")
+                    break
+                print(f"[JuiceWRLD Radio] Catalog endpoint {endpoint} responded but contained no playable audio candidates.")
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError, TypeError) as exc:
+                last_error = exc
+                print(f"[JuiceWRLD Radio] Catalog request {endpoint} failed: {type(exc).__name__}: {exc}")
+
+        if not audio_files:
+            # Keep and use an in-memory stale cache if one exists; never throw away
+            # a previously successful catalog merely because the refresh timed out.
+            if _jw_radio_catalog_cache:
+                print(f"[JuiceWRLD Radio] Refresh failed; reusing {len(_jw_radio_catalog_cache)} cached candidate(s).")
+                return _jw_radio_catalog_cache
+            if last_error:
+                raise RuntimeError(
+                    "The catalog endpoints timed out or failed after retries. "
+                    "The API may be slow or temporarily unavailable; try `~jwradio` again shortly."
+                ) from last_error
+            raise ValueError("The Juice WRLD API returned no playable audio files from its catalog endpoints.")
+
+        now = time.time()
+        _jw_radio_catalog_cache = audio_files
+        _jw_radio_catalog_cache_at = now
+        try:
+            JUICEWRLD_CATALOG_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            cache_payload = {
+                "cached_at": now,
+                "files": [{"path": path, "info": info} for path, info in audio_files],
+            }
+            tmp_path = JUICEWRLD_CATALOG_CACHE_FILE.with_suffix(
+                JUICEWRLD_CATALOG_CACHE_FILE.suffix + ".tmp"
+            )
+            tmp_path.write_text(json.dumps(cache_payload, ensure_ascii=False), encoding="utf-8")
+            tmp_path.replace(JUICEWRLD_CATALOG_CACHE_FILE)
+            print(f"[JuiceWRLD Radio] Cached {len(audio_files)} playable audio file(s) at {JUICEWRLD_CATALOG_CACHE_FILE}.")
+        except (OSError, TypeError, ValueError) as exc:
+            print(f"[JuiceWRLD Radio] Could not save catalog cache: {type(exc).__name__}: {exc}")
+        return audio_files
+
+
+async def _get_jw_radio_catalog(progress_callback=None) -> list[tuple[str, dict]]:
+    """Use cached catalog immediately; refresh in the background when it is stale."""
+    global _jw_radio_catalog_cache
+    _load_jw_radio_catalog_disk_cache()
+    now = time.time()
+    if _jw_radio_catalog_cache:
+        age = max(0, now - _jw_radio_catalog_cache_at)
+        if age < _JW_RADIO_CATALOG_TTL_SECONDS:
+            return _jw_radio_catalog_cache
+        # Stale-while-revalidate: start immediately with the known list and
+        # refresh it for the next radio session/rotation.
+        try:
+            task = asyncio.create_task(_refresh_jw_radio_catalog(progress_callback=None))
+            task.add_done_callback(
+                lambda completed: print(
+                    f"[JuiceWRLD Radio] Background catalog refresh failed: {type(completed.exception()).__name__}: {completed.exception()}"
+                ) if not completed.cancelled() and completed.exception() else None
+            )
+        except RuntimeError:
+            pass
+        return _jw_radio_catalog_cache
+    return await _refresh_jw_radio_catalog(progress_callback=progress_callback)
+
+
+async def _fetch_random_jw_track(
+    requester: str,
+    avoid_title: str = "",
+    progress_callback=None,
+) -> Track:
+    """Pick a random song, avoiding the previous radio title when possible.
+
+    progress_callback, when supplied, receives (title, description) updates so
+    a slow catalog or download request never leaves the radio embed ambiguous.
+    """
+    async def report(title: str, description: str) -> None:
+        if progress_callback is not None:
+            try:
+                await progress_callback(title, description)
+            except Exception as exc:
+                # A Discord status edit failing should not prevent music playback.
+                print(f"[JuiceWRLD Radio] Status update failed: {type(exc).__name__}: {exc}")
+
+    _load_jw_radio_catalog_disk_cache()
+    if _jw_radio_catalog_cache:
+        await report(
+            "⚡ Using cached Juice WRLD catalog…",
+            f"Loaded **{len(_jw_radio_catalog_cache)}** playable file(s) from the local cache, so radio can skip the slow catalog request.",
+        )
+    else:
+        await report(
+            "📡 Checking Juice WRLD catalog…",
+            "No local catalog cache exists yet. Checking the API with a short timeout so radio can move on quickly if it stalls.",
+        )
+    audio_files = await _get_jw_radio_catalog(progress_callback=progress_callback)
+    # Re-apply the skip filters on cached entries as a guard against old cache data.
+    audio_files = [
+        (path, info) for path, info in audio_files
+        if Path(path).suffix.casefold() in {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus", ".aac"}
+        and not _jw_is_beat_or_instrumental(path, info)
+        and not _jw_is_fanmade_or_altered(path, info)
+    ]
+    if not audio_files:
+        # Cache could be stale or contain only files now rejected by the filters.
+        audio_files = await _refresh_jw_radio_catalog(progress_callback=progress_callback)
+    if not audio_files:
+        raise ValueError("The Juice WRLD API did not list any playable audio files.")
+
+    previous_key = _jw_radio_title_key(avoid_title) if avoid_title else ""
+    if previous_key:
+        different_titles = [
+            (path, info) for path, info in audio_files
+            if _jw_radio_title_key(Path(path).stem) != previous_key
+        ]
+        if not different_titles:
+            raise ValueError(
+                f"The API listing only offered another version of '{avoid_title}', "
+                "so I skipped it to avoid playing the same song back-to-back."
+            )
+        audio_files = different_titles
+
+    random.shuffle(audio_files)
+    candidates = audio_files[:5]
+    errors = []
+    await report(
+        "🎵 Catalog loaded — choosing a track…",
+        f"Found **{len(audio_files)}** playable file(s). I'll try up to **{len(candidates)}** candidates and skip unavailable files.",
+    )
+    # Don't let a single dead/slow host path prevent radio from starting.
+    for index, (path, file_info) in enumerate(candidates, start=1):
+        selected = dict(file_info) if isinstance(file_info, dict) else {}
+        selected["path"] = path
+        selected["name"] = Path(path).stem.replace("_", " ").replace("-", " ").strip()
+        await report(
+            f"⬇️ Preparing track ({index}/{len(candidates)})…",
+            f"Trying **{discord.utils.escape_markdown(Path(path).stem[:160])}**. If a file is unavailable, I'll automatically skip to another candidate.",
+        )
+        try:
+            track = await _download_juicewrld_track(selected, requester, radio_fast=True)
+            await report(
+                "✅ Track downloaded — starting radio…",
+                f"Prepared **{discord.utils.escape_markdown(track.title[:180])}**. Adding it to the shared music queue now.",
+            )
+            return track
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
+            status = getattr(exc, "status", None)
+            error_label = f"{type(exc).__name__} HTTP {status}" if status else type(exc).__name__
+            errors.append(f"{Path(path).name}: {error_label}")
+            print(f"[JuiceWRLD Radio] Skipping unavailable file {path!r}: {type(exc).__name__}: {exc}")
+    raise RuntimeError(
+        f"The API listed files, but all {len(candidates)} random candidates failed on the "
+        "compressed and original audio endpoints. " + "; ".join(errors[:5])
+    )
+
+
+@bot.command(name="jwradio")
+async def juicewrld_radio_command(ctx: commands.Context, action: str = "on"):
+    """Continuously play random Juice WRLD tracks until disabled or disconnected."""
+    if not ctx.guild:
+        return await ctx.send("Use this command inside a server.")
+
+    guild_id = ctx.guild.id
+    action = action.casefold().strip()
+    if action in {"off", "stop", "disable", "disabled"}:
+        was_active = guild_id in jw_radio_active or guild_id in jw_radio_starting
+        jw_radio_active.discard(guild_id)
+        jw_radio_starting.discard(guild_id)
+        # Any queued radio track is no longer needed; the current song may
+        # finish normally. ~stop or ~leave ends playback/disconnects immediately.
+        while get_queue(guild_id):
+            queued_track = get_queue(guild_id).popleft()
+            clean_temp_file(queued_track.local_path)
+        if not was_active:
+            return await ctx.send("Juice WRLD Radio isn't active in this server.")
+        return await ctx.send(embed=_music_status_embed(
+            "📻 JUICE WRLD RADIO  //  OFFLINE",
+            f"`◉ RADIO OFF`  `⬡ AUTO-QUEUE OFF`\n{MUSIC_BAR}\n\n"
+            "The current song can finish, but no more random tracks will be added.\n"
+            "▸ `~stop` stops playback\n"
+            "▸ `~leave` disconnects immediately",
+            JUICE_COLOR,
+        ))
+
+    if action not in {"on", "start", ""}:
+        return await ctx.send(f"Usage: `{PREFIX}jwradio` to start or `{PREFIX}jwradio off` to disable it.")
+    if guild_id in jw_radio_active:
+        return await ctx.send("📻 Juice WRLD Radio is already active. Use `~jwradio off` to disable it.")
+
+    status_message = await ctx.send(embed=_music_status_embed(
+        "📻 Starting Juice WRLD Radio…",
+        f"`◉ RADIO`  `⬡ STARTING`\n{MUSIC_BAR}\n\n"
+        "Connecting to voice, then checking the catalog for a playable track.",
+        JUICE_COLOR,
+    ))
+    try:
+        await ensure_voice(ctx)
+    except Exception as exc:
+        await _set_music_status(ctx, status_message, "⚠️ Couldn't start radio", str(exc), color=discord.Color.orange().value)
+        return
+
+    # Live progress state is also used by a heartbeat so the embed keeps giving
+    # feedback if the API or a remote audio host stalls between stage updates.
+    progress_state = {
+        "title": "📡 Checking Juice WRLD catalog…",
+        "description": "Contacting the API for the available audio-file list.",
+        "updated_at": asyncio.get_running_loop().time(),
+    }
+
+    async def report_radio_progress(title: str, description: str) -> None:
+        progress_state["title"] = title
+        progress_state["description"] = description
+        progress_state["updated_at"] = asyncio.get_running_loop().time()
+        await _set_music_status(ctx, status_message, title, description, color=JUICE_COLOR)
+
+    async def radio_progress_heartbeat() -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(12)
+            now = loop.time()
+            if now - progress_state["updated_at"] >= 20:
+                # Keep the original phase visible and clarify that the operation
+                # is still waiting on an API/audio response, not silently frozen.
+                heartbeat_description = (
+                    progress_state["description"]
+                    + "\n\n⏳ Still waiting on the API/audio host. Temporary timeouts are retried automatically."
+                )
+                await _set_music_status(
+                    ctx, status_message, progress_state["title"], heartbeat_description, color=JUICE_COLOR
+                )
+                progress_state["updated_at"] = now
+
+    # Activate before fetching so ~play and ~jwplay cannot race the radio start.
+    jw_radio_active.add(guild_id)
+    jw_radio_starting.add(guild_id)
+    loop_modes[guild_id] = "off"
+    # Take ownership of the queue immediately. The current track is allowed
+    # to finish, but previously queued tracks should not play ahead of radio.
+    while get_queue(guild_id):
+        queued_track = get_queue(guild_id).popleft()
+        clean_temp_file(queued_track.local_path)
+    await ctx.typing()
+    heartbeat_task = asyncio.create_task(radio_progress_heartbeat())
+    try:
+        track = await _fetch_random_jw_track(
+            "Juice WRLD Radio", progress_callback=report_radio_progress
+        )
+    except Exception as exc:
+        jw_radio_active.discard(guild_id)
+        jw_radio_starting.discard(guild_id)
+        print(f"[JuiceWRLD Radio] Could not start: {type(exc).__name__}: {exc}")
+        return await _set_music_status(
+            ctx, status_message, "❌ Couldn't start Juice WRLD Radio",
+            "The catalog could not be loaded or no playable file was returned. The API may be slow or temporarily unavailable. "
+            f"Details: {discord.utils.escape_markdown(str(exc))[:180]}",
+            color=discord.Color.red().value,
+        )
+    finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+        jw_radio_starting.discard(guild_id)
+
+    # If someone disabled radio while the initial file was downloading, don't
+    # enqueue or start the track after the disable command.
+    if guild_id not in jw_radio_active:
+        clean_temp_file(track.local_path)
+        return await _set_music_status(ctx, status_message, "📻 Radio was disabled", "Juice WRLD Radio was disabled before it could start.", color=discord.Color.orange().value)
+
+    # The current track is not interrupted; this random track starts next.
+    await queue_track(ctx, track, status_message=status_message)
+    await ctx.send(embed=_music_status_embed(
+        "📻 JUICE WRLD RADIO  //  ONLINE",
+        f"`◉ RADIO ACTIVE`  `⬡ AUTO-QUEUE`\n{MUSIC_BAR}\n\n"
+        "A random track loads automatically when each song ends.\n"
+        "▸ `~play` and `~jwplay` are locked while radio runs\n"
+        "▸ `~jwradio off` to disable",
+        JUICE_COLOR,
+    ))
+
+
+@bot.command(name="jwplay", aliases=["jwp"])
+async def juicewrld_play_command(ctx: commands.Context, *, query: str = ""):
+    """Search the Juice WRLD API and queue its audio in the shared music player."""
+    if not ctx.guild:
+        return await ctx.send("Use this command inside a server.")
+    if ctx.guild.id in jw_radio_active:
+        return await ctx.send(
+            f"📻 **Juice WRLD Radio is active** in this server. Disable it with `~jwradio off` "
+            "before using `~jwplay` / `~jwp`, or use `~stop` / `~leave` to stop the radio and disconnect me."
+        )
+    # With no argument, choose a random playable file. Supplying a title still
+    # searches for that specific song; the `random` keyword remains optional.
+    wants_random = not query.strip() or query.strip().casefold() == "random"
+
+    # Use the same per-guild Discord voice connection as ~play; never create
+    # a second player or a second queue for this command.
+    request_label = "a random Juice WRLD track" if wants_random else query.strip()
+    status_message = await ctx.send(embed=_music_status_embed(
+        "🔎 Searching Juice WRLD…",
+        f"`◎ SEARCHING`  `⬡ JUICE WRLD API`\n{MUSIC_BAR}\n\n"
+        f"Request: **{discord.utils.escape_markdown(request_label[:180])}**\n"
+        "Checking the catalog now.",
+        JUICE_COLOR,
+    ))
+    try:
+        await ensure_voice(ctx)
+    except Exception as exc:
+        await _set_music_status(ctx, status_message, "⚠️ Couldn't start playback", str(exc), color=discord.Color.orange().value)
+        return
+
+    await ctx.typing()
+    try:
+        if wants_random:
+            payload = await _juicewrld_api_get("/files/list-all/")
+            entries = _juicewrld_items(payload)
+            audio_files = _jw_audio_candidates(entries, query="", limit=10000)
+            if not audio_files:
+                # Some API deployments expose playable files through browse
+                # even when the flat listing is unavailable or empty.
+                payload = await _juicewrld_api_get("/files/browse/")
+                entries = _juicewrld_items(payload)
+                audio_files = _jw_audio_candidates(entries, query="", limit=10000)
+            if not audio_files:
+                return await _set_music_status(
+                    ctx, status_message, "❌ No playable Juice WRLD audio found",
+                    "The API listing did not contain a playable audio file right now.",
+                    color=discord.Color.red().value,
+                )
+            path, file_info = random.choice(audio_files)
+            selected = dict(file_info) if isinstance(file_info, dict) else {}
+            selected["path"] = path
+            selected["name"] = Path(path).stem.replace("_", " ").replace("-", " ").strip()
+            found_title = str(selected.get("title") or selected.get("name") or "Juice WRLD track")
+            await _set_music_status(
+                ctx, status_message, "✅ Found a track — preparing audio",
+                f"**{discord.utils.escape_markdown(found_title[:180])}**\nDownloading audio and adding it to the shared queue…",
+                color=BRAND_COLOR,
+            )
+            track = await _download_juicewrld_track(selected, ctx.author.display_name)
+            await queue_track(ctx, track, status_message=status_message)
+            return
+
+        payload = await _juicewrld_api_get(
+            "/songs/",
+            params={"search": query.strip(), "page_size": 25, "versions": "true"},
+        )
+        songs = [
+            item for item in _juicewrld_items(payload)
+            if isinstance(item, dict) and item.get("id") is not None
+        ]
+        if not songs:
+            return await _set_music_status(
+                ctx, status_message, "❌ No catalog match found",
+                f"No Juice WRLD catalog results found for **{discord.utils.escape_markdown(query[:100])}**.",
+                color=discord.Color.red().value,
+            )
+
+        songs.sort(key=lambda item: _jw_song_score(item, query), reverse=True)
+        selected = None
+        # Search results usually include `path`; when not, try a few details
+        # records in rank order so one metadata-only result doesn't block playback.
+        for candidate in songs[:8]:
+            item = dict(candidate)
+            if not item.get("path") and str(item.get("id", "")).isdigit():
+                try:
+                    detail = await _juicewrld_api_get(f"/songs/{int(item['id'])}/")
+                    if isinstance(detail, dict):
+                        item.update(detail)
+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+                    print(f"[JuiceWRLD] Audio detail lookup failed: {exc}")
+            if (isinstance(item.get("path"), str) and item["path"].strip()
+                    and not _jw_is_beat_or_instrumental(item["path"], item)
+                    and not _jw_is_fanmade_or_altered(item["path"], item)):
+                selected = item
+                break
+
+        if selected is None:
+            return await _set_music_status(
+                ctx, status_message, "⚠️ Song found, but no playable audio",
+                f"I found **{discord.utils.escape_markdown(str(songs[0].get('name') or query)[:100])}**, "
+                "but the catalog results did not include a downloadable audio file. Try another title or `~jwfiles`.",
+                color=discord.Color.orange().value,
+            )
+
+        found_title = str(selected.get("title") or selected.get("name") or query)
+        await _set_music_status(
+            ctx, status_message, "✅ MATCH FOUND  //  PREPARING AUDIO",
+            f"`◈ MATCH`  `⬡ DOWNLOADING`\n{MUSIC_BAR}\n\n"
+            f"**{discord.utils.escape_markdown(found_title[:180])}**\nDownloading audio and adding it to the shared queue…",
+            color=MUSIC_COLOR.value,
+        )
+        track = await _download_juicewrld_track(selected, ctx.author.display_name)
+        await queue_track(ctx, track, status_message=status_message)
+    except Exception as exc:
+        print(f"[JuiceWRLD] Playback request failed: {type(exc).__name__}: {exc}")
+        await _set_music_status(
+            ctx, status_message, "❌ Couldn't fetch playable audio",
+            f"Details: {discord.utils.escape_markdown(str(exc))[:220]}",
+            color=discord.Color.red().value,
+        )
 
 
 @bot.command(name="jwsong", aliases=["jwsearch", "jwmusicsearch"])
@@ -5592,6 +6787,119 @@ async def _fetch_fortnite() -> list:
     return items
 
 
+_HYPEX_IMG_CACHE: dict = {}
+
+
+def _hypex_image_ok(url: str) -> bool:
+    """True if a URL looks like a real post image (not an avatar, emoji, or video file)."""
+    low = url.lower()
+    parsed = urlparse(url)
+    host, path = parsed.netloc.lower(), parsed.path.lower()
+    if "profile_images" in path or "/emoji/" in path or "abs.twimg.com/emoji" in low:
+        return False
+    # X/Twitter media URLs often have NO file extension: pbs.twimg.com/media/ID?format=jpg&name=large
+    if host.endswith("twimg.com") and any(
+        part in path for part in ("/media/", "/ext_tw_video_thumb/", "/amplify_video_thumb/",
+                                  "/tweet_video_thumb/", "/card_img/")
+    ):
+        return True
+    if path.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+        return True
+    return bool(re.search(r"[?&]format=(jpg|jpeg|png|webp|gif)\b", low))
+
+
+def _hypex_normalize_image(url, strict: bool = True) -> Optional[str]:
+    if not isinstance(url, str):
+        return None
+    url = html.unescape(url.strip())
+    if url.startswith("//"):
+        url = "https:" + url
+    elif url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    if not url.startswith("https://"):
+        return None
+    if strict and not _hypex_image_ok(url):
+        return None
+    return url
+
+
+def _hypex_pick_image(entry, description_html: str) -> Optional[str]:
+    """Find the post's picture: feed media tags first, then <img>/<video poster> inside the post HTML."""
+    candidates = []
+    for node in entry.iter():
+        tag = node.tag if isinstance(node.tag, str) else ""
+        attrs = node.attrib
+        if tag.endswith(("}content", "}thumbnail")) or tag in ("content", "thumbnail", "enclosure"):
+            if attrs.get("url"):
+                candidates.append(attrs["url"])
+        if (tag.endswith("}link") or tag == "link") and attrs.get("rel") == "enclosure" and attrs.get("href"):
+            candidates.append(attrs["href"])
+    # The feed usually embeds the picture as <img src="..."> inside the description HTML,
+    # which html_to_text() strips out, so look for it BEFORE converting to plain text.
+    for match in re.finditer(r"""(?is)<(?:img|source|video)\b[^>]*?\b(?:src|poster)\s*=\s*["']([^"']+)["']""",
+                             description_html or ""):
+        candidates.append(match.group(1))
+    for candidate in candidates:
+        normalized = _hypex_normalize_image(candidate)
+        if normalized:
+            return normalized
+    return None
+
+
+def _hypex_image_from_api(data) -> Optional[str]:
+    """Pull a photo (or video thumbnail) from an FxTwitter API JSON response."""
+    tweet = data.get("tweet") if isinstance(data, dict) else None
+    if not isinstance(tweet, dict):
+        return None
+    for holder in (tweet, tweet.get("quote")):
+        media = holder.get("media") if isinstance(holder, dict) else None
+        if not isinstance(media, dict):
+            continue
+        for photo in media.get("photos") or []:
+            found = _hypex_normalize_image(photo.get("url") if isinstance(photo, dict) else None, strict=False)
+            if found:
+                return found
+        for video in media.get("videos") or []:
+            found = _hypex_normalize_image(video.get("thumbnail_url") if isinstance(video, dict) else None, strict=False)
+            if found:
+                return found
+    return None
+
+
+async def _hypex_fill_missing_images(items: list) -> None:
+    """Fallback: ask the FxTwitter API for the picture of any post whose feed entry had none."""
+    missing = [item for item in items if not item.get("image")]
+    if not missing:
+        return
+    timeout = aiohttp.ClientTimeout(total=12)
+    headers = {"Accept": "application/json", "User-Agent": "VaultBot/1.0 (+Discord Fortnite update feed)"}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        for item in missing:
+            match = re.search(r"(?:x|twitter|fxtwitter|fixupx)\.com/([^/]+)/status/(\d+)",
+                              str(item.get("url") or ""), flags=re.IGNORECASE)
+            if not match:
+                continue
+            user, status_id = match.groups()
+            if status_id in _HYPEX_IMG_CACHE:
+                item["image"] = _HYPEX_IMG_CACHE[status_id] or None
+                continue
+            image = None
+            try:
+                async with session.get(f"https://api.fxtwitter.com/{user}/status/{status_id}") as resp:
+                    if resp.status == 200:
+                        image = _hypex_image_from_api(await resp.json(content_type=None))
+                    elif resp.status != 404:
+                        print(f"[PatchNotes] HYPEX image lookup HTTP {resp.status} for {status_id}", flush=True)
+                        continue  # transient problem: don't cache, retry next poll
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                print(f"[PatchNotes] HYPEX image lookup failed for {status_id}: {type(exc).__name__}: {exc}", flush=True)
+                continue
+            _HYPEX_IMG_CACHE[status_id] = image or ""
+            while len(_HYPEX_IMG_CACHE) > 500:
+                _HYPEX_IMG_CACHE.pop(next(iter(_HYPEX_IMG_CACHE)))
+            item["image"] = image
+
+
 async def _fetch_hypex() -> list:
     """Read recent HYPEX posts through public FxEmbed RSS/Atom feed endpoints.
 
@@ -5656,6 +6964,7 @@ async def _fetch_hypex() -> list:
         guid = child_text(["guid", "id", "{http://www.w3.org/2005/Atom}id"]) or link or title
         description = child_text(["description", "{http://www.w3.org/2005/Atom}content", "{http://www.w3.org/2005/Atom}summary"])
         description = html.unescape(description)
+        description_html = description
         description = html_to_text(description, 3000)
         date_text = child_text(["pubDate", "published", "updated", "{http://www.w3.org/2005/Atom}published", "{http://www.w3.org/2005/Atom}updated"])
         try:
@@ -5663,13 +6972,7 @@ async def _fetch_hypex() -> list:
         except (TypeError, ValueError, OverflowError):
             date_value = _parse_date(date_text)
 
-        image = None
-        for node in entry.iter():
-            if node.tag.endswith("}content") or node.tag.endswith("}thumbnail") or node.tag == "enclosure":
-                candidate = node.attrib.get("url")
-                if candidate and candidate.startswith("https://") and any(ext in candidate.lower() for ext in (".jpg", ".jpeg", ".png", ".webp")):
-                    image = candidate
-                    break
+        image = _hypex_pick_image(entry, description_html)
         if not link.startswith(("https://", "http://")):
             link = "https://x.com/HYPEX"
         if not description:
@@ -5688,7 +6991,12 @@ async def _fetch_hypex() -> list:
             "source": "HYPEX // UNOFFICIAL SOURCE",
         })
     items.sort(key=lambda item: int(item.get("date") or 0), reverse=True)
-    return items[:8]
+    items = items[:8]
+    try:
+        await _hypex_fill_missing_images(items)
+    except Exception as exc:  # a picture lookup must never block an alert
+        print(f"[PatchNotes] HYPEX image fallback failed: {type(exc).__name__}: {exc}", flush=True)
+    return items
 
 
 FEEDS = {
@@ -7260,7 +8568,7 @@ def _vault_control_embed(page: str, guild: Optional[discord.Guild]) -> discord.E
         modules = [
             ('🎮 GAME RADAR', '`/freestuff` • `/patchnotes`', 'Free offers, Steam game announcements, and supported game feeds.'),
             ('🎵 MUSIC ENGINE', '`~play` • `~queue` • `~nowplaying`', 'Voice playback and queue controls.'),
-            ('🖤 JUICE WRLD', '`~jwsong`', 'Song/catalog search and optional tracker notifications.'),
+            ('🖤 JUICE WRLD', '`~jwplay` • `~jwradio` • `~jwsong`', 'Queues catalog audio, plays continuous random radio, and searches song metadata.'),
             ('🛡️ MODERATION', '`~ban` • `~timeout` • `~clear`', 'Server moderation tools, subject to permissions.'),
         ]
         for name, commands_text, description in modules:
