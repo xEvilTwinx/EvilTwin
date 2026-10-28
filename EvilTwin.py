@@ -41,6 +41,8 @@ import tempfile
 import time
 import threading
 import difflib
+import sqlite3
+import shlex
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -84,8 +86,7 @@ MUSIC_FOOTER = "⬡ VAULTBOT AUDIO  //  LIVE PLAYER"
 # Music settings.
 DEFAULT_VOLUME = 0.5
 MAX_VOLUME_PERCENT = 200  # 100 = original loudness; above that the audio is amplified
-# Prefer the compressed Juice WRLD endpoint; if 64k is unsupported, the downloader
-# falls back to the original but the strict per-track cap prevents large transfers.
+# Juice WRLD playback uses the compressed endpoint directly; it never downloads the original file as fallback.
 JW_PLAYBACK_BITRATE = os.getenv("VAULTBOT_JW_PLAYBACK_BITRATE", "64k").strip() or "64k"
 # Low-traffic mode: 32 kbps outgoing voice target (lower fidelity, less bandwidth).
 # Owners may set VAULTBOT_MUSIC_MAX_KBPS, but the safety cap stays at 48 kbps.
@@ -93,10 +94,9 @@ try:
     MUSIC_MAX_KBPS = min(48, max(24, int(os.getenv("VAULTBOT_MUSIC_MAX_KBPS", "32"))))
 except (TypeError, ValueError):
     MUSIC_MAX_KBPS = 32
-JW_RADIO_MAX_MB = 5
 VOICE_IDLE_LEAVE_SECONDS = 60
 ALLOWED_UPLOAD_SUFFIXES = {".mp3", ".wav", ".opus", ".ogg", ".m4a", ".flac"}
-MAX_UPLOAD_MB = 5
+MAX_UPLOAD_MB = 20
 
 # Juice WRLD API settings.
 # Public read endpoints are used by default; no API key is required for them.
@@ -132,29 +132,15 @@ JUICEWRLD_CATALOG_CACHE_FILE = Path(os.getenv(
 
 
 # =============================================================================
-# DAILY TRAFFIC SAFETY GUARD
+# TRAFFIC MONITOR (ADVISORY ONLY)
 # =============================================================================
 # FadeHost's full network meter is not exposed to this Python process. This
-# guard conservatively tracks downloaded media/API response bodies and estimates
-# Discord voice egress, then stops all music before the provider's nominal 1 GB
-# allowance should be approached. It is deliberately not presented as an exact
-# replacement for the host's traffic meter.
+# guard tracks known transfers and estimates voice egress where possible, but never
+# stops music based on this estimate. FadeHost's own traffic meter is authoritative.
 _TRAFFIC_MIB = 1024 * 1024
-# Strict conservative budget. When Linux exposes /sys/class/net counters, the guard
-# measures total container RX + TX (Discord, music, feeds and API requests together).
-# Stop at 75 MiB by default, leaving a very large reserve beneath FadeHost's 1 GB/day.
-# Keep the configured ceiling conservative even if an older environment value remains set.
-TRAFFIC_HARD_STOP_MIB = min(75, _positive_int_env("VAULTBOT_TRAFFIC_HARD_STOP_MIB", 75))
-TRAFFIC_WARNING_MIB = min(
-    max(1, TRAFFIC_HARD_STOP_MIB - 1),
-    _positive_int_env("VAULTBOT_TRAFFIC_WARNING_MIB", 45),
-)
-TRAFFIC_MAX_TRACK_DOWNLOAD_MIB = min(
-    5, _positive_int_env("VAULTBOT_TRAFFIC_MAX_TRACK_DOWNLOAD_MIB", 5)
-)
-TRAFFIC_DOWNLOAD_RESERVE_MIB = min(
-    20, _positive_int_env("VAULTBOT_TRAFFIC_DOWNLOAD_RESERVE_MIB", 15)
-)
+# Monitor-only mode: the estimate never disables music or API features.
+# Warnings are advisory; FadeHost's control panel is the authoritative meter.
+TRAFFIC_WARNING_MIB = _positive_int_env("VAULTBOT_TRAFFIC_WARNING_MIB", 750)
 TRAFFIC_VOICE_OVERHEAD_FACTOR = 1.35
 TRAFFIC_CHECK_INTERVAL_SECONDS = 1
 # 5-minute buckets provide a conservative rolling 24-hour window without
@@ -169,6 +155,7 @@ _TRAFFIC_COUNTER_KEYS = (
     "audio_download_bytes",
     "attachment_download_bytes",
     "api_response_bytes",
+    "stream_input_estimated_bytes",
     "voice_estimated_bytes",
     "network_interface_bytes",
 )
@@ -176,6 +163,7 @@ _TRAFFIC_FALLBACK_COUNTER_KEYS = (
     "audio_download_bytes",
     "attachment_download_bytes",
     "api_response_bytes",
+    "stream_input_estimated_bytes",
     "voice_estimated_bytes",
 )
 _TRAFFIC_LOCK = threading.RLock()
@@ -186,18 +174,13 @@ _TRAFFIC_STATE = {
     "audio_download_bytes": 0,
     "attachment_download_bytes": 0,
     "api_response_bytes": 0,
+    "stream_input_estimated_bytes": 0,
     "voice_estimated_bytes": 0,
     "network_interface_bytes": 0,
     "interface_accounting_active": False,
     "interface_baselines": {},
     "warning_sent": False,
-    "hard_stopped": False,
-    "hard_stop_notified_guilds": [],
 }
-
-
-class TrafficBudgetError(RuntimeError):
-    """Raised when a new media transfer would spend the reserved traffic budget."""
 
 
 def _traffic_bucket_id() -> int:
@@ -215,7 +198,6 @@ def _traffic_save_locked(force: bool = False) -> None:
         str(key): dict(value) for key, value in _TRAFFIC_STATE.get("buckets", {}).items()
         if isinstance(value, dict)
     }
-    payload["hard_stop_notified_guilds"] = list(_TRAFFIC_STATE.get("hard_stop_notified_guilds", []))
     candidates = []
     for candidate in (_TRAFFIC_STATE_PATH, TRAFFIC_STATE_FILE, _TRAFFIC_FALLBACK_STATE_FILE):
         if candidate not in candidates:
@@ -232,10 +214,9 @@ def _traffic_save_locked(force: bool = False) -> None:
             return
         except OSError as exc:
             last_error = exc
-    # Without persisted state, a restart could reset usage. Fail closed instead.
-    _TRAFFIC_STATE["hard_stopped"] = True
+    # The monitor must never gate music, even when its optional state file cannot be written.
     if not getattr(_traffic_save_locked, "warned", False):
-        print(f"[TrafficGuard] Could not persist traffic state; failing closed and disabling music: {last_error}", flush=True)
+        print(f"[TrafficMeter] Could not persist its estimate; traffic figures may reset after a restart: {last_error}", flush=True)
         _traffic_save_locked.warned = True
 
 
@@ -319,8 +300,6 @@ def _traffic_sample_network_io() -> bool:
             _TRAFFIC_STATE["interface_accounting_active"] = True
             _TRAFFIC_STATE["interface_baselines"] = counters
             used = _traffic_refresh_totals_locked()
-            if used >= TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB:
-                _TRAFFIC_STATE["hard_stopped"] = True
             _traffic_save_locked(force=True)
             print(
                 f"[TrafficGuard] Linux network counters enabled; tracking {used / _TRAFFIC_MIB:.1f} MiB RX+TX.",
@@ -352,10 +331,8 @@ def _traffic_sample_network_io() -> bool:
             )
             bucket["network_interface_bytes"] = max(0, int(bucket.get("network_interface_bytes", 0) or 0)) + delta
         _TRAFFIC_STATE["interface_baselines"] = counters
-        used = _traffic_refresh_totals_locked()
-        if used >= TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB:
-            _TRAFFIC_STATE["hard_stopped"] = True
-        _traffic_save_locked(force=bool(used >= TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB))
+        _traffic_refresh_totals_locked()
+        _traffic_save_locked()
     return True
 
 
@@ -384,13 +361,12 @@ def _traffic_load_state() -> None:
             "audio_download_bytes": 0,
             "attachment_download_bytes": 0,
             "api_response_bytes": 0,
+            "stream_input_estimated_bytes": 0,
             "voice_estimated_bytes": 0,
             "network_interface_bytes": 0,
             "interface_accounting_active": False,
             "interface_baselines": {},
             "warning_sent": False,
-            "hard_stopped": False,
-            "hard_stop_notified_guilds": [],
         })
         if isinstance(data, dict):
             raw_buckets = data.get("buckets")
@@ -413,7 +389,6 @@ def _traffic_load_state() -> None:
                 if legacy_total:
                     _TRAFFIC_STATE["buckets"][str(_traffic_bucket_id())] = legacy_values
             _TRAFFIC_STATE["warning_sent"] = bool(data.get("warning_sent", False))
-            _TRAFFIC_STATE["hard_stopped"] = bool(data.get("hard_stopped", False))
             _TRAFFIC_STATE["interface_accounting_active"] = bool(data.get("interface_accounting_active", False))
             saved_baselines = data.get("interface_baselines", {})
             if isinstance(saved_baselines, dict):
@@ -428,37 +403,22 @@ def _traffic_load_state() -> None:
                         except (TypeError, ValueError):
                             continue
                 _TRAFFIC_STATE["interface_baselines"] = parsed_baselines
-            notified = data.get("hard_stop_notified_guilds", [])
-            _TRAFFIC_STATE["hard_stop_notified_guilds"] = [str(x) for x in notified if str(x).isdigit()] if isinstance(notified, list) else []
-
         used = _traffic_refresh_totals_locked()
-        if used >= TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB:
-            _TRAFFIC_STATE["hard_stopped"] = True
         _TRAFFIC_LOADED = True
         _traffic_save_locked(force=True)
         print(
-            f"[TrafficGuard] Loaded {used / _TRAFFIC_MIB:.1f}/{TRAFFIC_HARD_STOP_MIB} MiB in the rolling 24-hour window.",
+            f"[TrafficMeter] Loaded {used / _TRAFFIC_MIB:.1f} MiB in the rolling 24-hour monitoring window (no music block).",
             flush=True,
         )
 
 
 def _traffic_ensure_current_window() -> None:
+    """Prune expired buckets and persist the advisory rolling estimate."""
     _traffic_load_state()
     with _TRAFFIC_LOCK:
         used = _traffic_refresh_totals_locked()
-        cap = TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB
-        reserve = TRAFFIC_DOWNLOAD_RESERVE_MIB * _TRAFFIC_MIB
         warning = TRAFFIC_WARNING_MIB * _TRAFFIC_MIB
-        if used >= cap:
-            _TRAFFIC_STATE["hard_stopped"] = True
-        elif _TRAFFIC_STATE.get("hard_stopped") and used + reserve < cap:
-            # Usage has aged out of the rolling window far enough to safely allow music again.
-            _TRAFFIC_STATE["hard_stopped"] = False
-            _TRAFFIC_STATE["hard_stop_notified_guilds"] = []
-            _TRAFFIC_STATE["warning_sent"] = used >= warning
-            print(f"[TrafficGuard] Rolling usage fell to {used / _TRAFFIC_MIB:.1f} MiB; music may resume.", flush=True)
-            _traffic_save_locked(force=True)
-        elif used < warning:
+        if used < warning:
             _TRAFFIC_STATE["warning_sent"] = False
         _traffic_save_locked()
 
@@ -471,84 +431,30 @@ def _traffic_snapshot() -> dict:
         # moment the snapshot is taken.
         used_bytes = _traffic_refresh_totals_locked()
         snapshot = dict(_TRAFFIC_STATE)
-        snapshot["hard_stop_notified_guilds"] = list(_TRAFFIC_STATE.get("hard_stop_notified_guilds", []))
         snapshot["used_bytes"] = used_bytes
         return snapshot
 
 
 def _traffic_record_bytes(amount: int, counter: str) -> bool:
-    """Account for known bytes in the current 5-minute bucket."""
+    """Record known transfer bytes for the dashboard; never block a feature."""
     if counter not in _TRAFFIC_COUNTER_KEYS or amount <= 0:
-        return not _traffic_is_blocked()
+        return True
     _traffic_ensure_current_window()
-    # Refresh Linux RX/TX counters immediately at media-chunk boundaries. Otherwise a
-    # fast download burst can pass the budget between the normal background samples.
-    # This does not double-count bytes: when interface accounting is active, its delta
-    # remains the total; per-feature counters are retained for diagnostics/fallback only.
     try:
         _traffic_sample_network_io()
     except Exception as exc:
-        print(f"[TrafficGuard] Immediate network sample failed: {type(exc).__name__}: {exc}", flush=True)
+        print(f"[TrafficMeter] Immediate network sample failed: {type(exc).__name__}: {exc}", flush=True)
     with _TRAFFIC_LOCK:
-        was_stopped = bool(_TRAFFIC_STATE.get("hard_stopped"))
         bucket_key = str(_traffic_bucket_id())
         buckets = _TRAFFIC_STATE.setdefault("buckets", {})
         bucket = buckets.setdefault(bucket_key, {key: 0 for key in _TRAFFIC_COUNTER_KEYS})
         bucket[counter] = max(0, int(bucket.get(counter, 0) or 0)) + int(amount)
-        used = _traffic_refresh_totals_locked()
-        if used >= TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB:
-            _TRAFFIC_STATE["hard_stopped"] = True
-        _traffic_save_locked(force=(not was_stopped and _TRAFFIC_STATE["hard_stopped"]))
-        return not bool(_TRAFFIC_STATE.get("hard_stopped"))
+        _traffic_refresh_totals_locked()
+        _traffic_save_locked()
+    return True
 
 
-def _traffic_is_blocked() -> bool:
-    """Block optional network requests once the protected reserve would be spent."""
-    snapshot = _traffic_snapshot()
-    soft_limit = max(0, TRAFFIC_HARD_STOP_MIB - TRAFFIC_DOWNLOAD_RESERVE_MIB) * _TRAFFIC_MIB
-    return bool(snapshot.get("hard_stopped")) or snapshot["used_bytes"] >= soft_limit
 
-
-def _traffic_can_start_music() -> bool:
-    snapshot = _traffic_snapshot()
-    cap = TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB
-    reserve = TRAFFIC_DOWNLOAD_RESERVE_MIB * _TRAFFIC_MIB
-    return not snapshot.get("hard_stopped") and snapshot["used_bytes"] + reserve < cap
-
-
-def _traffic_download_allowance_bytes() -> int:
-    """Return a per-track cap while leaving room for ongoing voice and untracked traffic."""
-    snapshot = _traffic_snapshot()
-    if snapshot.get("hard_stopped"):
-        return 0
-    cap = TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB
-    reserve = TRAFFIC_DOWNLOAD_RESERVE_MIB * _TRAFFIC_MIB
-    remaining = cap - snapshot["used_bytes"] - reserve
-    if remaining < 1 * _TRAFFIC_MIB:
-        return 0
-    return min(TRAFFIC_MAX_TRACK_DOWNLOAD_MIB * _TRAFFIC_MIB, remaining)
-
-
-def _traffic_can_download(size_bytes: int) -> bool:
-    snapshot = _traffic_snapshot()
-    if snapshot.get("hard_stopped"):
-        return False
-    remaining = TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB - snapshot["used_bytes"]
-    reserve = TRAFFIC_DOWNLOAD_RESERVE_MIB * _TRAFFIC_MIB
-    return int(size_bytes) >= 0 and int(size_bytes) + reserve <= remaining
-
-
-def _traffic_protection_embed(hard: bool = False) -> discord.Embed:
-    snapshot = _traffic_snapshot()
-    used_mib = snapshot["used_bytes"] / _TRAFFIC_MIB
-    title = "🛡️ DAILY TRAFFIC PROTECTION ACTIVE" if hard or snapshot.get("hard_stopped") else "⚠️ DAILY MUSIC BUDGET NEAR LIMIT"
-    description = (
-        f"Tracked estimate: **{used_mib:.1f} / {TRAFFIC_HARD_STOP_MIB} MiB**\n"
-        "VaultBot is limiting music to keep a safety margin below FadeHost's daily allowance. "
-        "Music downloads resume as older traffic ages out of the rolling 24-hour window.\n\n"
-        "Check `~traffic` for the breakdown."
-    )
-    return discord.Embed(title=title, description=description, color=MUSIC_ERROR_COLOR if hard else MUSIC_WARN_COLOR)
 
 # =============================================================================
 # 3. BOT SETUP
@@ -568,6 +474,27 @@ intents.members = True
 # help_command=None disables discord.py's built-in help so the custom
 # multi-page help in section 9 can take over the ~help command.
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
+
+# Lightweight member join/leave history used by ~profile. The path follows the
+# legacy XP DB environment variable so existing profile history remains available.
+PROFILE_DB_PATH = Path(os.getenv(
+    "VAULTBOT_PROFILE_DB",
+    os.getenv("VAULTBOT_XP_DB", "/data/vaultbot_xp.sqlite3"),
+))
+
+def _profile_connect():
+    PROFILE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(PROFILE_DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS profile_presence (
+            guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, joins INTEGER NOT NULL DEFAULT 0,
+            leaves INTEGER NOT NULL DEFAULT 0, first_recorded_join TEXT, last_joined TEXT,
+            PRIMARY KEY (guild_id, user_id)
+        )"""
+    )
+    return conn
+
 
 
 # =============================================================================
@@ -715,6 +642,7 @@ class Track:
     local_path: Optional[str] = None
     duration: Optional[int] = None
     source_name: str = "audio"
+    stream_headers: Optional[str] = None
 
 
 def get_queue(guild_id: int) -> deque:
@@ -942,9 +870,6 @@ async def extract_track(query: str, requester: str, on_found=None) -> Track:
 
     def _extract(query: str, notify_found=None):
         folder = tempfile.mkdtemp(prefix="vaultbot_audio_")
-        download_allowance = _traffic_download_allowance_bytes()
-        if download_allowance <= 0:
-            raise TrafficBudgetError("VaultBot's traffic safety budget is nearly exhausted; music downloads are paused until older usage ages out of the rolling 24-hour window.")
         options = dict(YTDL_OPTIONS)
         options.update({
             "outtmpl": str(Path(folder) / "%(id)s.%(ext)s"),
@@ -952,9 +877,6 @@ async def extract_track(query: str, requester: str, on_found=None) -> Track:
             "noplaylist": True,
             "playlist_items": "1",
             "skip_download": False,
-            # This is advisory for extractors that know the source size; the hook
-            # below is the live guard for sources that don't publish a file size.
-            "max_filesize": int(download_allowance),
         })
         found_notified = False
         accounted_downloaded_bytes = 0
@@ -970,14 +892,7 @@ async def extract_track(query: str, requester: str, on_found=None) -> Track:
                 if downloaded > accounted_downloaded_bytes:
                     delta = downloaded - accounted_downloaded_bytes
                     accounted_downloaded_bytes = downloaded
-                    if not _traffic_record_bytes(delta, "audio_download_bytes"):
-                        raise yt_dlp.utils.DownloadError(
-                            "VaultBot daily traffic safety budget reached; audio download aborted."
-                        )
-                    if accounted_downloaded_bytes > download_allowance:
-                        raise yt_dlp.utils.DownloadError(
-                            f"VaultBot per-track download allowance exhausted ({download_allowance // _TRAFFIC_MIB} MiB); download aborted."
-                        )
+                    _traffic_record_bytes(delta, "audio_download_bytes")
             if found_notified or status != "downloading" or notify_found is None:
                 return
             info = progress.get("info_dict") or {}
@@ -1047,14 +962,8 @@ async def extract_track(query: str, requester: str, on_found=None) -> Track:
             except OSError:
                 final_size = 0
             if final_size > accounted_downloaded_bytes:
-                if not _traffic_record_bytes(final_size - accounted_downloaded_bytes, "audio_download_bytes"):
-                    raise TrafficBudgetError("VaultBot daily traffic safety budget reached; track was discarded.")
+                _traffic_record_bytes(final_size - accounted_downloaded_bytes, "audio_download_bytes")
                 accounted_downloaded_bytes = final_size
-            if accounted_downloaded_bytes > download_allowance:
-                raise TrafficBudgetError(
-                    f"This source exceeded VaultBot's {download_allowance // _TRAFFIC_MIB} MiB per-track transfer allowance."
-                )
-
             diag("yt-dlp: download finished")
             return {
                 "title": info.get("title") or "Unknown title",
@@ -1117,9 +1026,6 @@ async def play_next(ctx: commands.Context) -> None:
     """Start the next item. Called after a track ends."""
     if not ctx.guild:
         return
-    if _traffic_is_blocked():
-        await _traffic_stop_all_music()
-        return
     guild_id = ctx.guild.id
     async with get_lock(guild_id):
         voice = ctx.guild.voice_client
@@ -1179,8 +1085,8 @@ async def play_next(ctx: commands.Context) -> None:
                 try:
                     await ctx.send(embed=_music_status_embed(
                         "⚠️ JUICE WRLD RADIO  //  STOPPED",
-                        f"`▲ API / DOWNLOAD FAILURE`\n{MUSIC_BAR}\n\n"
-                        "Radio stopped after repeated failures.\n"
+                        f"`▲ API / STREAM FAILURE`\n{MUSIC_BAR}\n\n"
+                        "Radio stopped after repeated stream failures; original audio files are never downloaded as fallback.\n"
                         "▸ Try `~jwradio` again in a minute\n\n"
                         f"> {discord.utils.escape_markdown(str(exc))[:180]}",
                         MUSIC_WARN_COLOR,
@@ -1205,10 +1111,17 @@ async def play_next(ctx: commands.Context) -> None:
         volume = volumes.get(guild_id, DEFAULT_VOLUME)
 
         try:
-            if not track.local_path or not Path(track.local_path).is_file():
-                raise ValueError("The downloaded audio file is missing. Try the song again.")
-            # Both YouTube downloads and Discord attachments play from local files.
-            audio = discord.FFmpegPCMAudio(track.local_path, **FFMPEG_OPTIONS)
+            if track.stream_url:
+                before_options = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 3 -rw_timeout 15000000"
+                if track.stream_headers:
+                    before_options += f" -headers {shlex.quote(track.stream_headers)}"
+                audio = discord.FFmpegPCMAudio(
+                    track.stream_url, before_options=before_options, **FFMPEG_OPTIONS
+                )
+            else:
+                if not track.local_path or not Path(track.local_path).is_file():
+                    raise ValueError("The local audio file is missing. Try the song again.")
+                audio = discord.FFmpegPCMAudio(track.local_path, **FFMPEG_OPTIONS)
 
             source = discord.PCMVolumeTransformer(audio, volume=volume)
 
@@ -1277,17 +1190,6 @@ async def queue_track(
     status_message: Optional[discord.Message] = None,
 ) -> None:
     guild_id = ctx.guild.id
-    if _traffic_is_blocked():
-        clean_temp_file(track.local_path)
-        if status_message is not None:
-            await _set_music_status(
-                ctx, status_message, "🛡️ Daily traffic protection active",
-                "The daily traffic safety threshold was reached before this track could be queued. Music is paused until older usage ages out of the rolling window.",
-                color=discord.Color.red().value,
-            )
-        else:
-            await ctx.send(embed=_traffic_protection_embed(hard=True))
-        return
     get_queue(guild_id).append(track)
     queue_position = len(get_queue(guild_id))
     if status_message is not None:
@@ -1314,7 +1216,7 @@ async def queue_track(
 
 
 
-# ---- Enforce the daily traffic budget and estimate voice egress ----
+# ---- Estimate traffic and voice egress (monitor only) ----
 _TRAFFIC_LAST_VOICE_TICK = 0.0
 
 
@@ -1328,81 +1230,15 @@ async def _traffic_send_notice(guild_id: int, embed: discord.Embed) -> None:
             pass
 
 
-async def _traffic_stop_all_music() -> None:
-    """Stop playback/queues across all servers once the tracked safety budget is spent."""
-    for guild in list(bot.guilds):
-        guild_id = guild.id
-        voice = guild.voice_client
-        queued = get_queue(guild_id)
-        has_music = bool(
-            voice is not None or queued or guild_id in current_tracks
-            or guild_id in jw_radio_active or guild_id in jw_radio_starting
-        )
-        if not has_music:
-            continue
-
-        # Reserve the one-time notice before awaiting voice disconnects or sends;
-        # the voice player's after-callback can re-enter this function concurrently.
-        with _TRAFFIC_LOCK:
-            notified_now = set(str(x) for x in _TRAFFIC_STATE.get("hard_stop_notified_guilds", []))
-            already_notified = str(guild_id) in notified_now
-            if not already_notified:
-                notified_now.add(str(guild_id))
-                _TRAFFIC_STATE["hard_stop_notified_guilds"] = sorted(notified_now)
-                _traffic_save_locked(force=True)
-        async with get_lock(guild_id):
-            voice = guild.voice_client
-            pending = list(get_queue(guild_id))
-            get_queue(guild_id).clear()
-            for pending_track in pending:
-                clean_temp_file(pending_track.local_path)
-            current = current_tracks.pop(guild_id, None)
-            if current:
-                clean_temp_file(current.local_path)
-            jw_radio_active.discard(guild_id)
-            jw_radio_starting.discard(guild_id)
-            loop_modes[guild_id] = "off"
-            if voice is not None:
-                try:
-                    if voice.is_playing() or voice.is_paused():
-                        voice.stop()
-                except Exception:
-                    pass
-                try:
-                    await voice.disconnect(force=True)
-                except TypeError:
-                    try:
-                        await voice.disconnect()
-                    except (discord.HTTPException, RuntimeError):
-                        pass
-                except (discord.HTTPException, RuntimeError):
-                    pass
-
-        if not already_notified:
-            await _traffic_send_notice(
-                guild_id,
-                discord.Embed(
-                    title="🛡️ VAULTBOT // DAILY TRAFFIC GUARD",
-                    description=(
-                        f"Tracked usage reached the **{TRAFFIC_HARD_STOP_MIB} MiB safety threshold**.\n"
-                        "Music playback has been stopped, queues cleared, and new music downloads are paused "
-                        "until enough older usage ages out of the rolling 24-hour window. This leaves a reserve below FadeHost's nominal 1 GB/day cap.\n\n"
-                        "Use `~traffic` to view the estimate. The host's own meter remains authoritative."
-                    ),
-                    color=MUSIC_ERROR_COLOR,
-                ),
-            )
-
-
 async def _traffic_send_warning() -> None:
     snapshot = _traffic_snapshot()
     used_mib = snapshot["used_bytes"] / _TRAFFIC_MIB
     embed = discord.Embed(
         title="⚠️ VAULTBOT // TRAFFIC WARNING",
         description=(
-            f"Tracked daily usage is **{used_mib:.1f} MiB**. The hard stop is **{TRAFFIC_HARD_STOP_MIB} MiB**.\n"
-            "VaultBot will automatically stop music and refuse new audio downloads at the safety threshold.\n"
-            "Use `~traffic` to see the tracked breakdown. The window rolls over 24 hours."
+            f"Tracked rolling-24-hour usage is **{used_mib:.1f} MiB**.\n"
+            "This is an advisory estimate only; VaultBot will not automatically block or stop music.\n"
+            "Use FadeHost's meter for authoritative usage and `~traffic` for the bot's estimate."
         ),
         color=MUSIC_WARN_COLOR,
     )
@@ -1414,7 +1250,7 @@ async def _traffic_send_warning() -> None:
 
 @tasks.loop(seconds=TRAFFIC_CHECK_INTERVAL_SECONDS)
 async def traffic_guard_task():
-    """Count active voice egress conservatively and stop music on budget exhaustion."""
+    """Estimate traffic and send advisory warnings; this task never stops music."""
     global _TRAFFIC_LAST_VOICE_TICK
     now = time.monotonic()
     if _TRAFFIC_LAST_VOICE_TICK <= 0:
@@ -1429,6 +1265,7 @@ async def traffic_guard_task():
         has_interface_meter = bool(_TRAFFIC_STATE.get("interface_accounting_active")) and network_sample_available
 
     voice_bytes = 0
+    stream_input_bytes = 0
     if not has_interface_meter and elapsed > 0:
         for guild in list(bot.guilds):
             voice = guild.voice_client
@@ -1441,13 +1278,23 @@ async def traffic_guard_task():
             except (TypeError, ValueError, AttributeError):
                 pass
             voice_bytes += int(elapsed * kbps * 1000 / 8 * TRAFFIC_VOICE_OVERHEAD_FACTOR)
+            active_track = current_tracks.get(guild.id)
+            if active_track is not None and active_track.stream_url:
+                try:
+                    match = re.match(r"\s*(\d+(?:\.\d+)?)\s*k", JW_PLAYBACK_BITRATE, re.IGNORECASE)
+                    input_kbps = float(match.group(1)) if match else 64.0
+                except (TypeError, ValueError):
+                    input_kbps = 64.0
+                # Estimate source-side compressed bytes separately from Discord voice output.
+                stream_input_bytes += int(elapsed * input_kbps * 1000 / 8 * 1.10)
+    if stream_input_bytes:
+        _traffic_record_bytes(stream_input_bytes, "stream_input_estimated_bytes")
     if voice_bytes:
         _traffic_record_bytes(voice_bytes, "voice_estimated_bytes")
 
     snapshot = _traffic_snapshot()
     used_bytes = snapshot["used_bytes"]
     warning_bytes = TRAFFIC_WARNING_MIB * _TRAFFIC_MIB
-    hard_bytes = TRAFFIC_HARD_STOP_MIB * _TRAFFIC_MIB
     if used_bytes >= warning_bytes and not snapshot.get("warning_sent"):
         with _TRAFFIC_LOCK:
             if not _TRAFFIC_STATE.get("warning_sent"):
@@ -1457,16 +1304,8 @@ async def traffic_guard_task():
             else:
                 should_warn = False
         if should_warn:
-            print(f"[TrafficGuard] Warning threshold reached at {used_bytes / _TRAFFIC_MIB:.1f} MiB.", flush=True)
+            print(f"[TrafficMeter] Advisory warning threshold reached at {used_bytes / _TRAFFIC_MIB:.1f} MiB.", flush=True)
             await _traffic_send_warning()
-
-    if snapshot.get("hard_stopped") or used_bytes >= hard_bytes:
-        if not snapshot.get("hard_stopped"):
-            _traffic_record_bytes(0, "voice_estimated_bytes")
-            with _TRAFFIC_LOCK:
-                _TRAFFIC_STATE["hard_stopped"] = True
-                _traffic_save_locked(force=True)
-        await _traffic_stop_all_music()
 
 
 @traffic_guard_task.before_loop
@@ -1477,28 +1316,24 @@ async def before_traffic_guard_task():
 
 @bot.command(name="traffic", aliases=["bandwidth"])
 async def traffic_status_command(ctx: commands.Context):
-    """Show the conservative, persisted daily traffic estimate."""
+    """Show the best-effort rolling traffic estimate; never blocks music."""
     snapshot = _traffic_snapshot()
     used_mib = snapshot["used_bytes"] / _TRAFFIC_MIB
     download_mib = snapshot["audio_download_bytes"] / _TRAFFIC_MIB
     attachment_mib = snapshot["attachment_download_bytes"] / _TRAFFIC_MIB
     api_mib = snapshot["api_response_bytes"] / _TRAFFIC_MIB
+    stream_input_mib = snapshot["stream_input_estimated_bytes"] / _TRAFFIC_MIB
     voice_mib = snapshot["voice_estimated_bytes"] / _TRAFFIC_MIB
-    percent = min(100, int((used_mib / max(1, TRAFFIC_HARD_STOP_MIB)) * 100))
-    stopped = (
-        bool(snapshot.get("hard_stopped"))
-        or used_mib >= TRAFFIC_HARD_STOP_MIB
-        or used_mib + TRAFFIC_DOWNLOAD_RESERVE_MIB >= TRAFFIC_HARD_STOP_MIB
-    )
+    warning_hit = used_mib >= TRAFFIC_WARNING_MIB
     embed = discord.Embed(
-        title="⬡ VAULTBOT // DAILY TRAFFIC METER",
+        title="⬡ VAULTBOT // TRAFFIC MONITOR",
         description=(
-            f"**{used_mib:.1f} / {TRAFFIC_HARD_STOP_MIB} MiB tracked**  ·  **{percent}%**\n"
-            f"{'🛑 Music protection is active.' if stopped else '🟢 Music protection is monitoring usage.'}\n"
-            "Accounting window: **rolling 24 hours**\n"
-            + ("Counter: **container network RX + TX** (Discord, music, API and feed traffic)." if snapshot.get("interface_accounting_active") else "Counter: **tracked estimates only**; Linux network counters unavailable.")
+            f"**{used_mib:.1f} MiB tracked estimate**\n"
+            f"{'⚠️ Advisory warning threshold reached.' if warning_hit else '🟢 Monitoring only; music is not automatically blocked.'}\n"
+            "Window: **rolling 24 hours**\n"
+            + ("Counter: **container network RX + TX** (includes all container networking)." if snapshot.get("interface_accounting_active") else "Counter: **tracked estimates only**; Linux network counters unavailable.")
         ),
-        color=MUSIC_ERROR_COLOR if stopped else (MUSIC_WARN_COLOR if used_mib >= TRAFFIC_WARNING_MIB else MUSIC_COLOR),
+        color=MUSIC_WARN_COLOR if warning_hit else MUSIC_COLOR,
     )
     if snapshot.get("interface_accounting_active"):
         interface_mib = snapshot.get("network_interface_bytes", 0) / _TRAFFIC_MIB
@@ -1508,40 +1343,37 @@ async def traffic_status_command(ctx: commands.Context):
             f"⬇️ Audio downloads (diagnostic): **{download_mib:.1f} MiB**\n"
             f"📎 Attachments (diagnostic): **{attachment_mib:.1f} MiB**\n"
             f"API response bodies (diagnostic): **{api_mib:.1f} MiB**\n"
-            "*Diagnostics overlap with the network counter and are not added again.*"
+            f"📥 Compressed stream input estimate (diagnostic): **{stream_input_mib:.1f} MiB**\n"
+            "*Diagnostic categories overlap with RX + TX and are not added again.*"
         )
     else:
-        diagnostic_sum_mib = download_mib + attachment_mib + api_mib + voice_mib
-        # The fallback total is based on tracked per-feature counters. If the
-        # category display disagrees dramatically with that total, flag it rather
-        # than implying that the category figures are a trustworthy breakdown.
+        diagnostic_sum_mib = download_mib + attachment_mib + api_mib + stream_input_mib + voice_mib
         mismatch_tolerance_mib = max(10.0, used_mib * 0.25)
         if diagnostic_sum_mib > used_mib + mismatch_tolerance_mib:
             breakdown_value = (
-                "⚠️ **Diagnostic breakdown mismatch**\n"
-                f"Category counters sum to **{diagnostic_sum_mib:.1f} MiB**, but the tracked total is **{used_mib:.1f} MiB**.\n"
-                "These figures are inconsistent, so the individual categories cannot reliably identify today's traffic source. "
-                "The displayed tracked total is used for VaultBot's guard; FadeHost's own meter remains authoritative."
+                "⚠️ **Diagnostic counters disagree**\n"
+                f"Categories sum to **{diagnostic_sum_mib:.1f} MiB**, but the tracked total is **{used_mib:.1f} MiB**.\n"
+                "Treat category values as estimates only; FadeHost's usage meter is authoritative."
             )
         else:
             breakdown_value = (
                 f"🎧 Voice egress estimate: **{voice_mib:.1f} MiB**\n"
                 f"⬇️ Audio files downloaded: **{download_mib:.1f} MiB**\n"
                 f"📎 Discord audio uploads received: **{attachment_mib:.1f} MiB**\n"
-                f"🌐 Juice WRLD API response bodies: **{api_mib:.1f} MiB**"
+                f"🌐 API response bodies: **{api_mib:.1f} MiB**\n"
+                f"📥 Compressed stream input estimate: **{stream_input_mib:.1f} MiB**"
             )
-    embed.add_field(name="Tracked usage breakdown", value=breakdown_value, inline=False)
+    embed.add_field(name="Traffic breakdown (estimates)", value=breakdown_value, inline=False)
     embed.add_field(
-        name="Protection settings",
+        name="Current behavior",
         value=(
-            f"Warning: **{TRAFFIC_WARNING_MIB} MiB**\n"
-            f"Hard stop: **{TRAFFIC_HARD_STOP_MIB} MiB**\n"
-            f"Max per-track download: **{TRAFFIC_MAX_TRACK_DOWNLOAD_MIB} MiB**\n"
-            "Accounting window: **rolling 24 hours**"
+            f"Advisory warning threshold: **{TRAFFIC_WARNING_MIB} MiB**\n"
+            "Daily traffic blocking: **disabled**\n"
+            "Juice WRLD `~jwplay` / `~jwradio`: **direct compressed stream only; no original-file fallback**"
         ),
         inline=False,
     )
-    embed.set_footer(text="RX+TX is measured when Linux exposes network counters; FadeHost's usage meter remains authoritative.")
+    embed.set_footer(text="Estimate only. FadeHost's own daily traffic meter is authoritative.")
     await ctx.send(embed=embed)
 
 
@@ -1600,8 +1432,6 @@ async def _juicewrld_api_get(
         sock_connect=min(20, timeout_seconds),
         sock_read=min(40, timeout_seconds),
     )
-    if _traffic_is_blocked():
-        raise TrafficBudgetError("VaultBot's traffic safety budget has been reached; optional API lookups are paused until older usage ages out of the rolling 24-hour window.")
     headers = {"Accept": "application/json"}
     if JUICEWRLD_API_KEY:
         headers["X-API-Key"] = JUICEWRLD_API_KEY
@@ -1615,11 +1445,8 @@ async def _juicewrld_api_get(
                 ) as response:
                     response.raise_for_status()
                     body = await response.read()
-                    if not _traffic_record_bytes(len(body), "api_response_bytes"):
-                        raise TrafficBudgetError("VaultBot's daily traffic safety budget has been reached; API response was not processed.")
+                    _traffic_record_bytes(len(body), "api_response_bytes")
                     return json.loads(body.decode("utf-8-sig"))
-        except TrafficBudgetError:
-            raise
         except aiohttp.ClientResponseError as exc:
             # Retry server-side errors, but don't keep retrying invalid requests/auth failures.
             if exc.status < 500:
@@ -1736,7 +1563,7 @@ def _juicewrld_add_event_metadata(embed: discord.Embed, item: dict) -> None:
 async def juicewrld_tracker_task():
     """Poll the tracker feed and post polished updates plus distinct new-song alerts."""
     global _juicewrld_baseline_initialized
-    if not JUICEWRLD_CHANNEL_ID or _traffic_is_blocked():
+    if not JUICEWRLD_CHANNEL_ID:
         return
 
     try:
@@ -1898,7 +1725,11 @@ HELP_PAGES: list[dict] = [
             ),
             (
                 "💡 Tips & Troubleshooting — page 6",
-                "Requirements, supported sources, and fixes for common problems.",
+                "Requirements, supported sources, traffic estimates, and common fixes.",
+            ),
+            (
+                "🧰 More features — pages 7–12",
+                "AI questions, staff moderation, FreeStuff alerts, Steam/game/driver patch notes, Twitch Drops, member profiles, automatic replies, and the traffic monitor.",
             ),
         ],
     },
@@ -1910,15 +1741,13 @@ HELP_PAGES: list[dict] = [
         "summary": "Play songs, upload files, view the queue, skip, stop",
         "color": BRAND_COLOR,
         "description": (
-            "Join a voice channel, then use these commands. The bot joins "
-            "you automatically and starts playing as soon as a song is ready."
+            "Join a voice channel, then use these commands. VaultBot joins automatically. `~play` uses yt-dlp to prepare a local audio file; `~jwplay` and `~jwradio` instead open the Juice WRLD compressed stream directly through FFmpeg."
         ),
         "fields": [
             (
                 f"`{PREFIX}play <song or URL>`  •  `{PREFIX}p`",
-                "Searches for the song (or opens the link you give it), "
-                "downloads the audio, and adds it to the queue. If nothing is "
-                "playing, it starts right away.",
+                "Searches for the song or resolves your URL with yt-dlp, then downloads a local audio file before queueing it. "
+                "If nothing is playing, it starts right away. This command prepares the audio locally; for direct compressed streaming, use `~jwplay` or `~jwradio`.",
             ),
             (
                 f"`{PREFIX}play` + an attached file",
@@ -1986,20 +1815,18 @@ HELP_PAGES: list[dict] = [
         "summary": "Catalog search, shared-queue playback, and tracker updates",
         "color": JUICE_COLOR,
         "description": (
-            "Catalog tools powered by the Juice WRLD API. `~jwplay` queues tracks in the shared player; "
-            "`~jwradio` continuously plays random tracks and blocks manual play commands until disabled."
+            "Catalog tools powered by the Juice WRLD API. `~jwplay` and `~jwradio` open the compressed audio endpoint directly through FFmpeg; they do not save full songs to disk or fall back to original WAV/FLAC downloads. `~jwradio` owns the shared player until disabled."
         ),
         "fields": [
             (
                 f"`{PREFIX}jwplay` / `{PREFIX}jwp` (random) or `{PREFIX}jwplay <song>`",
-                "Searches for a Juice WRLD catalog match and queues its available audio in the same queue as "
-                f"`{PREFIX}play`. It will not interrupt a song already playing.\n"
+                "Searches the Juice WRLD catalog and opens its compressed audio stream directly in FFmpeg. No full-song download is saved to disk; if the compressed endpoint rejects a track, VaultBot skips it rather than fetching the original file. It uses the same queue as "
+                f"`{PREFIX}play` and will not interrupt a song already playing.\n"
                 f"Example: `{PREFIX}jwplay lucid dreams`",
             ),
             (
                 f"`{PREFIX}jwradio` / `{PREFIX}jwradio off`",
-                "Continuously queues random Juice WRLD tracks. While radio is active, `~play` and `~jwplay` "
-                "are blocked; disable radio with `~jwradio off` or use `~stop` / `~leave` to stop/disconnect.",
+                "Continuously streams random Juice WRLD tracks through the compressed API endpoint. While radio is active, `~play` and `~jwplay` are blocked to keep the shared queue under radio control; disable it with `~jwradio off` or use `~stop` / `~leave` to stop/disconnect.",
             ),
             (
                 f"`{PREFIX}jwsong <search>`",
@@ -2037,7 +1864,7 @@ HELP_PAGES: list[dict] = [
         "aliases": ("server", "admin", "staff", "announce", "musicdrop", "ping"),
         "emoji": "📣",
         "title": "Server Tools (Slash Commands)",
-        "summary": "/musicdrop, /announce, /ping and /help",
+        "summary": "Music drops, announcements, server stats, Control Center, ping/help",
         "color": BRAND_COLOR,
         "description": "Type `/` in the message box to see these. Some are staff-only.",
         "fields": [
@@ -2063,6 +1890,18 @@ HELP_PAGES: list[dict] = [
                 "Enable Server Widget in Server Settings first.",
             ),
             (
+                "`/memberstats` 🔒 Manage Channels",
+                "Creates or refreshes a read-only SERVER STATS category with total member count and combined online/offline counts. It refreshes every five minutes. Enable Presence and Server Members intents in the Discord Developer Portal for accurate counts.",
+            ),
+            (
+                "`/vault` or `~vault` / `~dashboard`",
+                "Opens VaultBot's interactive Control Center for a guided overview of the bot, its tools, and configuration/help sections.",
+            ),
+            (
+                "`~traffic` / `~bandwidth`",
+                "Shows the bot's best-effort rolling 24-hour traffic estimate and whether it can read the container's network counters. It is a monitor only and does not block music; FadeHost's own meter is authoritative.",
+            ),
+            (
                 "`/ping`",
                 "Checks that the bot is online and shows its latency. "
                 "Only you can see the reply.",
@@ -2081,7 +1920,7 @@ HELP_PAGES: list[dict] = [
         "title": "Tips & Troubleshooting",
         "summary": "Requirements, supported sources, and common fixes",
         "color": BRAND_COLOR,
-        "description": "Quick answers if something isn't working the way you expect.",
+        "description": "Quick answers if something isn't working the way you expect. Traffic tracking is advisory, and Juice WRLD playback is stream-only.",
         "fields": [
             (
                 "🔊 Before you play",
@@ -2107,8 +1946,8 @@ HELP_PAGES: list[dict] = [
                 "command on the earlier pages.",
             ),
             (
-                "🛡️ Daily traffic protection",
-                f"Use `~traffic` to view VaultBot's rolling traffic meter. On Linux hosts with readable network counters, the bot measures container RX + TX; it pauses new music and optional network requests at {TRAFFIC_HARD_STOP_MIB - TRAFFIC_DOWNLOAD_RESERVE_MIB} MiB and stops active music at {TRAFFIC_HARD_STOP_MIB} MiB by default. Optional update feeds and AI calls also pause to protect the remaining allowance. FadeHost's own meter remains authoritative.",
+                "🛡️ Traffic monitor",
+                "Use `~traffic` / `~bandwidth` to see VaultBot's rolling estimate. The monitor does not block or stop music; some hosts do not expose network counters, so FadeHost's own meter is authoritative. Juice WRLD commands use direct compressed streaming, but traffic is still used while audio is playing.",
             ),
             (
                 "🧭 Using this menu",
@@ -2204,7 +2043,7 @@ HELP_PAGES: list[dict] = [
         "color": BRAND_COLOR,
         "description": "Some VaultBot features run automatically and don't need a command.",
         "fields": [
-            ("`~profile [@member]`", "Shows a member profile embed with their avatar, account creation date, server join date, server tenure, roles, VaultBot XP/message stats when available, and joins/departures recorded since this feature was installed."),
+            ("`~profile [@member]`", "Shows a member profile embed with their avatar, account creation date, server join date, server tenure, roles, and joins/departures recorded since this feature was installed."),
             ("Random chat replies", "When enabled, VaultBot may occasionally reply to messages containing greetings (`hello`, `hi`, `hey`, `yo`), morning/night greetings, laughter, or game-related words. It can also react to image uploads with a short reply. Replies are randomized, only considered in servers, and are limited by a per-channel cooldown."),
             ("Current auto-reply settings", "Auto-replies are enabled in this build with a 40% chance after a matching message and a 60-second per-channel cooldown. These values and the reply text can be changed in the script (`AUTO_REPLY_ENABLED`, `AUTO_REPLY_CHANCE`, `AUTO_REPLY_COOLDOWN`, `AUTO_REPLY_KEYWORDS`, and `AUTO_REPLY_IMAGES`)."),
             ("Other background features", "The Juice WRLD tracker can post unseen tracker changes when `JUICEWRLD_CHANNEL_ID` is configured. Patch Notes, FreeStuff, and Twitch Drops each have their own host settings and setup requirements on their dedicated pages. Features that depend on external feeds or API keys remain unavailable until configured and reachable."),
@@ -2348,7 +2187,7 @@ async def on_ready():
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} global slash command(s): " + ", ".join(cmd.name for cmd in synced))
-        # Optional guild sync makes newly-added commands (such as /xp) appear
+        # Optional guild sync makes newly-added commands appear
         # immediately in the configured server instead of waiting for global propagation.
         guild_id_raw = os.getenv("DISCORD_GUILD_ID", "").strip()
         if guild_id_raw.isdigit():
@@ -2374,15 +2213,6 @@ async def on_ready():
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
-    traffic_error = error if isinstance(error, TrafficBudgetError) else None
-    if isinstance(error, commands.CommandInvokeError) and isinstance(error.original, TrafficBudgetError):
-        traffic_error = error.original
-    if traffic_error is not None:
-        try:
-            await ctx.send(embed=_traffic_protection_embed(hard=_traffic_is_blocked()))
-        except discord.HTTPException:
-            pass
-        return
     if isinstance(error, commands.CommandNotFound):
         return
     if isinstance(error, commands.CheckFailure) and ctx.command and ctx.command.name in {"ban", "unban", "timeout", "untimeout"}:
@@ -2443,7 +2273,7 @@ async def on_member_join(member: discord.Member):
         return
     try:
         now = datetime.now(timezone.utc).isoformat()
-        with _xp_connect() as db:
+        with _profile_connect() as db:
             db.execute(
                 """INSERT INTO profile_presence (guild_id, user_id, joins, leaves, first_recorded_join, last_joined)
                    VALUES (?, ?, 1, 0, ?, ?)
@@ -2463,7 +2293,7 @@ async def on_member_remove(member: discord.Member):
     if member.bot:
         return
     try:
-        with _xp_connect() as db:
+        with _profile_connect() as db:
             db.execute(
                 """INSERT INTO profile_presence (guild_id, user_id, joins, leaves, first_recorded_join, last_joined)
                    VALUES (?, ?, 0, 1, NULL, NULL)
@@ -2478,14 +2308,6 @@ async def on_member_remove(member: discord.Member):
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
-
-    # XP tracking is separate from existing auto-replies and command handling.
-    # Prefix commands are intentionally excluded from XP farming.
-    if message.guild and not message.content.startswith(PREFIX):
-        try:
-            await _xp_process_message(message)
-        except Exception as error:
-            print(f"[XP] Message tracking failed: {type(error).__name__}: {error}")
 
     # Commands are handled normally and never get an auto-reply.
     if message.content.startswith(PREFIX):
@@ -2542,7 +2364,7 @@ async def profile_command(ctx: commands.Context, member: Optional[discord.Member
     embed = discord.Embed(
         title=f"👤 {target.display_name} • Member Profile",
         description=f"{target.mention}\n`{target}` · ID: `{target.id}`",
-        color=XP_COLOR if "XP_COLOR" in globals() else BRAND_COLOR,
+        color=BRAND_COLOR,
         timestamp=now,
     )
     embed.set_thumbnail(url=target.display_avatar.url)
@@ -2574,31 +2396,19 @@ async def profile_command(ctx: commands.Context, member: Optional[discord.Member
     embed.add_field(name="⏳ Server Tenure", value=tenure, inline=True)
 
     try:
-        with _xp_connect() as db:
+        with _profile_connect() as db:
             row = db.execute(
                 "SELECT joins, leaves FROM profile_presence WHERE guild_id=? AND user_id=?",
-                (ctx.guild.id, target.id),
-            ).fetchone()
-            xp_row = db.execute(
-                "SELECT total_xp, messages FROM xp_profiles WHERE guild_id=? AND user_id=?",
                 (ctx.guild.id, target.id),
             ).fetchone()
     except Exception as error:
         print(f"[Profile] Could not load profile: {type(error).__name__}: {error}")
         row = None
-        xp_row = None
 
     joins = int(row["joins"]) if row else 0
     leaves = int(row["leaves"]) if row else 0
     embed.add_field(name="🔄 Recorded Joins", value=str(joins), inline=True)
     embed.add_field(name="🚪 Recorded Departures", value=str(leaves), inline=True)
-    if xp_row:
-        total_xp = int(xp_row["total_xp"])
-        messages = int(xp_row["messages"])
-        level = _xp_level(total_xp) if "_xp_level" in globals() else "—"
-        embed.add_field(name="✨ VaultBot XP", value=f"Level **{level}** · **{total_xp:,} XP**", inline=True)
-        embed.add_field(name="💬 Tracked Messages", value=f"{messages:,}", inline=True)
-
     roles = [role.mention for role in reversed(target.roles) if not role.is_default()]
     if roles:
         role_text = " · ".join(roles[:10])
@@ -2947,8 +2757,6 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
     """Play a song name, supported URL, or attached MP3/WAV/Opus file."""
     if not ctx.guild:
         return await ctx.send("Use this command inside a server.")
-    if not _traffic_can_start_music():
-        return await ctx.send(embed=_traffic_protection_embed(hard=_traffic_is_blocked()))
     if ctx.guild.id in jw_radio_active:
         return await ctx.send(
             f"📻 **Juice WRLD Radio is active** in this server. Disable it with `~jwradio off` "
@@ -2980,12 +2788,7 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
             return await _set_music_status(ctx, status_message, "❌ Unsupported audio file", "Attach an MP3, WAV, Opus, OGG, M4A, or FLAC audio file.", color=discord.Color.red().value)
         if attachment.size > MAX_UPLOAD_MB * 1024 * 1024:
             return await _set_music_status(ctx, status_message, "❌ File is too large", f"That file is over the bot's {MAX_UPLOAD_MB} MB safety limit.", color=discord.Color.red().value)
-        if not _traffic_can_download(attachment.size):
-            return await _set_music_status(
-                ctx, status_message, "🛡️ Daily traffic protection active",
-                "This upload would use the reserved traffic budget. Try again when enough older usage ages out of the rolling 24-hour window, or use a smaller file. Run `~traffic` for the current estimate.",
-                color=discord.Color.red().value,
-            )
+
         if not query:
             query = attachment.filename
         try:
@@ -2994,13 +2797,7 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
             await attachment.save(path)
             TEMP_FILES.add(path)
             actual_upload_bytes = Path(path).stat().st_size
-            if not _traffic_record_bytes(actual_upload_bytes, "attachment_download_bytes"):
-                clean_temp_file(path)
-                return await _set_music_status(
-                    ctx, status_message, "🛡️ Daily traffic protection active",
-                    "The daily traffic safety threshold was reached while receiving that file. The upload was discarded and music is paused until older usage ages out of the rolling window.",
-                    color=discord.Color.red().value,
-                )
+            _traffic_record_bytes(actual_upload_bytes, "attachment_download_bytes")
             TEMP_FILES.add(path)
             track = Track(
                 title=attachment.filename,
@@ -3026,9 +2823,9 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
 
     async def _on_play_found(found_title: str) -> None:
         await _set_music_status(
-            ctx, status_message, "✅ MATCH FOUND  //  PREPARING AUDIO",
-            f"`◈ MATCH`  `⬡ DOWNLOADING`\n{MUSIC_BAR}\n\n"
-            f"**{discord.utils.escape_markdown(found_title[:180])}**\nDownloading audio and adding it to the shared queue…",
+            ctx, status_message, "✅ MATCH FOUND  //  OPENING STREAM",
+            f"`◈ MATCH`  `⬡ LIVE STREAM`\n{MUSIC_BAR}\n\n"
+            f"**{discord.utils.escape_markdown(found_title[:180])}**\nOpening a compressed live stream and adding it to the shared queue…",
             color=MUSIC_COLOR.value,
         )
 
@@ -3040,13 +2837,6 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
         error_text = str(exc)
         print(f"yt-dlp error: {error_text}", flush=True)
         lower_error = error_text.lower()
-        if _traffic_is_blocked() or "traffic safety budget" in lower_error or "per-track download allowance" in lower_error or "per-track transfer allowance" in lower_error:
-            await _set_music_status(
-                ctx, status_message, "🛡️ TRAFFIC GUARD  //  DOWNLOAD STOPPED",
-                "VaultBot stopped this transfer to protect the daily traffic budget. Music automatically pauses at the hard threshold. Run `~traffic` for the current estimate.",
-                color=discord.Color.red().value,
-            )
-            return
         if (
             ("confirm you" in lower_error and "not a bot" in lower_error)
             or "sign in to confirm" in lower_error
@@ -3963,9 +3753,6 @@ def _juicewrld_group_buy_from_row(row):
 
 
 async def _fetch_juicewrld_group_buys():
-    # When the safety budget is reached, use the saved archive instead of a live request.
-    if _traffic_is_blocked():
-        return []
     # Keep a live lookup quick: Cloudflare may reject non-browser requests.
     timeout = aiohttp.ClientTimeout(total=8)
     headers = {
@@ -4024,8 +3811,6 @@ _JWGB_LIVE_RETRY_AT = 0.0
 
 async def _jw_get_json_url(url: str, params: Optional[dict] = None):
     """Fetch JSON from an absolute API URL without adding browser-challenge workarounds."""
-    if _traffic_is_blocked():
-        return []
     timeout = aiohttp.ClientTimeout(total=18)
     headers = {"Accept": "application/json", "User-Agent": "VaultBot/1.0 (Juice WRLD lookup)"}
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
@@ -4545,8 +4330,6 @@ def _jw_sniff_image_ext(data: bytes) -> Optional[str]:
 
 async def _jw_download_image(session: aiohttp.ClientSession, url: str, max_bytes: int = 8_000_000):
     """Download one image. Returns (bytes, extension) or None; failures are logged, never raised."""
-    if _traffic_is_blocked():
-        return None
     try:
         async with session.get(_jw_clean_url(url), allow_redirects=True) as resp:
             if resp.status != 200:
@@ -4557,9 +4340,7 @@ async def _jw_download_image(session: aiohttp.ClientSession, url: str, max_bytes
             chunks, total = [], 0
             async for chunk in resp.content.iter_chunked(65536):
                 total += len(chunk)
-                if not _traffic_record_bytes(len(chunk), "api_response_bytes"):
-                    print("[jwcover] daily traffic safety threshold reached; image result discarded", flush=True)
-                    return None
+                _traffic_record_bytes(len(chunk), "api_response_bytes")
                 if total > max_bytes:
                     print(f"[jwcover] too large (> {max_bytes} bytes): {url}", flush=True)
                     return None
@@ -4725,129 +4506,72 @@ def _jw_parse_duration(song: dict) -> Optional[int]:
     return None
 
 
-async def _download_juicewrld_track(
+async def _stream_juicewrld_track(
     song: dict, requester: str, *, radio_fast: bool = False
 ) -> Track:
-    """Download an API audio file; radio mode favors quick skips over long stalls."""
+    """Return a direct FFmpeg URL for compressed audio; never download/save the song.
+
+    The compressed endpoint is deliberately the only audio endpoint used here.
+    If it refuses a track (for example HTTP 406), the request fails rather than
+    falling back to a potentially huge original WAV/FLAC file.
+    """
     raw_path = song.get("path")
     if not isinstance(raw_path, str) or not raw_path.strip():
-        raise ValueError("This catalog result does not have a downloadable audio path.")
-
+        raise ValueError("This catalog result does not have a streamable audio path.")
     remote_path = raw_path.strip().replace("\\", "/")
     if remote_path.startswith(("http://", "https://")) or ".." in remote_path.split("/"):
         raise ValueError("The API returned an invalid audio path.")
 
-    original_suffix = Path(remote_path).suffix.lower()
-    if original_suffix not in {".mp3", ".wav", ".opus", ".ogg", ".m4a", ".flac", ".aac", ".mp4"}:
-        original_suffix = ".mp3"
-
-    # Try the API's smaller compressed MP3 endpoint first (large WAV files can
-    # be slow to serve), then ALWAYS fall back to the documented original-file
-    # stream endpoint. The API may reject transcoding with HTTP 406 for files
-    # that it can still serve normally; radio must not give up on those tracks.
-    attempts = [
-        ("files/download-compressed/", {"path": remote_path, "bitrate": JW_PLAYBACK_BITRATE}, ".mp3"),
-        ("files/download/", {"path": remote_path}, original_suffix),
-    ]
-    headers = {"Accept": "audio/*, application/octet-stream"}
+    params = {"path": remote_path, "bitrate": JW_PLAYBACK_BITRATE}
+    stream_url = f"{JUICEWRLD_API_BASE}/files/download-compressed/?{urlencode(params)}"
+    # Use wildcard Accept to avoid API content-negotiation 406s for file attachments.
+    headers = {"Accept": "*/*", "User-Agent": "VaultBot/1.0"}
+    stream_headers = None
     if JUICEWRLD_API_KEY:
         headers["X-API-Key"] = JUICEWRLD_API_KEY
+        stream_headers = f"X-API-Key: {JUICEWRLD_API_KEY}\r\n"
 
-    max_bytes = (JW_RADIO_MAX_MB if radio_fast else 200) * 1024 * 1024
-    # Even manual JW playback uses a modest per-track cap. This preserves normal
-    # songs while preventing huge lossless files from eating the day's allowance.
-    max_bytes = min(max_bytes, TRAFFIC_MAX_TRACK_DOWNLOAD_MIB * _TRAFFIC_MIB)
-    last_error = None
-    for endpoint, params, suffix in attempts:
-        endpoint_attempts = 1 if radio_fast else 3
-        for attempt in range(endpoint_attempts):
-            allowance = _traffic_download_allowance_bytes()
-            if allowance <= 0:
-                raise TrafficBudgetError("VaultBot's traffic safety budget is nearly exhausted; music downloads are paused until older usage ages out of the rolling 24-hour window.")
-            max_bytes = min(max_bytes, allowance)
-            folder = Path(tempfile.mkdtemp(prefix="vaultbot_audio_"))
-            local_path = folder / f"juicewrld{suffix}"
-            total_bytes = 0
-            # Radio uses a short per-candidate budget and moves on quickly;
-            # manual requests retain the longer timeout and retries.
-            timeout = (
-                aiohttp.ClientTimeout(total=35, sock_connect=10, sock_read=25)
-                if radio_fast
-                else aiohttp.ClientTimeout(total=360, sock_connect=60, sock_read=90)
-            )
-            try:
-                async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                    async with session.get(
-                        f"{JUICEWRLD_API_BASE}/{endpoint}", params=params
-                    ) as response:
-                        response.raise_for_status()
-                        content_type = response.headers.get("Content-Type", "").lower()
-                        if "application/json" in content_type or "text/html" in content_type:
-                            detail = (await response.text())[:180]
-                            raise ValueError(f"The API did not return audio data. {detail}")
-                        declared = response.content_length
-                        if declared and declared > max_bytes:
-                            # Refuse before downloading anything, so oversized files cost no data.
-                            raise ValueError(
-                                f"File is {declared // (1024 * 1024)} MB, over the {max_bytes // (1024 * 1024)} MB limit."
-                            )
-                        with local_path.open("wb") as output:
-                            async for chunk in response.content.iter_chunked(128 * 1024):
-                                if not chunk:
-                                    continue
-                                total_bytes += len(chunk)
-                                allowed = _traffic_record_bytes(len(chunk), "audio_download_bytes")
-                                if not allowed:
-                                    raise TrafficBudgetError("VaultBot daily traffic safety budget reached; audio download aborted.")
-                                if total_bytes > max_bytes:
-                                    raise TrafficBudgetError(
-                                        f"This audio file exceeded VaultBot's {max_bytes // _TRAFFIC_MIB} MiB per-track traffic allowance; it was discarded."
-                                    )
-                                output.write(chunk)
-                if total_bytes == 0:
-                    raise ValueError("The API returned an empty audio file.")
+    timeout_seconds = 18 if radio_fast else 25
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds, sock_connect=8, sock_read=12)
+    # Preflight only the response headers + a tiny prefix. Closing this response
+    # avoids downloading the full song; FFmpeg opens its own streamed connection.
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.get(stream_url) as response:
+            if response.status == 406:
+                small_body = await response.content.read(256)
+                detail = small_body.decode("utf-8", errors="replace").strip()[:120]
+                suffix = f" API says: {detail}" if detail and not detail.startswith("ID3") else ""
+                raise ValueError(
+                    f"The compressed Juice WRLD stream endpoint rejected this track (HTTP 406). "
+                    f"VaultBot did not download the original file.{suffix}"
+                )
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "").lower()
+            if "application/json" in content_type or "text/html" in content_type:
+                detail = (await response.content.read(256)).decode("utf-8", errors="replace")[:120]
+                raise ValueError(f"The API returned a non-audio response: {detail}")
+            first_bytes = await response.content.read(1024)
+            if not first_bytes:
+                raise ValueError("The compressed endpoint returned an empty stream.")
 
-                title = str(song.get("name") or song.get("title") or Path(remote_path).stem or "Juice WRLD track")
-                song_id = song.get("id")
-                webpage_url = (
-                    f"{JUICEWRLD_API_BASE}/songs/{int(song_id)}/"
-                    if song_id is not None and str(song_id).isdigit()
-                    else "https://juicewrldapi.com/"
-                )
-                path_text = str(local_path)
-                TEMP_FILES.add(path_text)
-                return Track(
-                    title=title,
-                    webpage_url=webpage_url,
-                    requester=requester,
-                    local_path=path_text,
-                    duration=_jw_parse_duration(song),
-                    source_name="Juice WRLD API",
-                )
-            except TrafficBudgetError:
-                shutil.rmtree(folder, ignore_errors=True)
-                raise
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                last_error = exc
-                print(
-                    f"[JuiceWRLD Audio] Endpoint {endpoint} failed for {remote_path!r}: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-                shutil.rmtree(folder, ignore_errors=True)
-                if attempt < endpoint_attempts - 1:
-                    await asyncio.sleep(1.5 * (attempt + 1))
-            except Exception as exc:
-                shutil.rmtree(folder, ignore_errors=True)
-                # Invalid/non-audio response: move on to the next endpoint.
-                last_error = exc
-                print(
-                    f"[JuiceWRLD Audio] Endpoint {endpoint} returned unusable data "
-                    f"for {remote_path!r}: {type(exc).__name__}: {exc}"
-                )
-                break
-    if last_error:
-        raise last_error
-    raise ValueError("The Juice WRLD API could not provide playable audio.")
+    title = str(song.get("name") or song.get("title") or Path(remote_path).stem or "Juice WRLD track")
+    song_id = song.get("id")
+    webpage_url = (
+        f"{JUICEWRLD_API_BASE}/songs/{int(song_id)}/"
+        if song_id is not None and str(song_id).isdigit()
+        else "https://juicewrldapi.com/"
+    )
+    print(f"[JuiceWRLD Stream] Preflight passed for {title!r}; FFmpeg will stream at {JW_PLAYBACK_BITRATE}.", flush=True)
+    return Track(
+        title=title,
+        webpage_url=webpage_url,
+        requester=requester,
+        stream_url=stream_url,
+        local_path=None,
+        duration=_jw_parse_duration(song),
+        source_name="Juice WRLD API Stream",
+        stream_headers=stream_headers,
+    )
 
 
 # Catalog caches: in-memory for same-process radio rotations and JSON on disk
@@ -5053,13 +4777,13 @@ async def _fetch_random_jw_track(
         selected["name"] = Path(path).stem.replace("_", " ").replace("-", " ").strip()
         await report(
             f"⬇️ Preparing track ({index}/{len(candidates)})…",
-            f"Trying **{discord.utils.escape_markdown(Path(path).stem[:160])}**. If a file is unavailable, I'll automatically skip to another candidate.",
+            f"Trying **{discord.utils.escape_markdown(Path(path).stem[:160])}** through the compressed stream endpoint. If it is unavailable, I'll skip it without downloading the original file.",
         )
         try:
-            track = await _download_juicewrld_track(selected, requester, radio_fast=True)
+            track = await _stream_juicewrld_track(selected, requester, radio_fast=True)
             await report(
-                "✅ Track downloaded — starting radio…",
-                f"Prepared **{discord.utils.escape_markdown(track.title[:180])}**. Adding it to the shared music queue now.",
+                "✅ Stream ready — starting radio…",
+                f"Opened a direct compressed stream for **{discord.utils.escape_markdown(track.title[:180])}**. Adding it to the shared music queue now.",
             )
             return track
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
@@ -5069,7 +4793,7 @@ async def _fetch_random_jw_track(
             print(f"[JuiceWRLD Radio] Skipping unavailable file {path!r}: {type(exc).__name__}: {exc}")
     raise RuntimeError(
         f"The API listed files, but all {len(candidates)} random candidates failed on the "
-        "compressed and original audio endpoints. " + "; ".join(errors[:5])
+        "compressed streaming endpoint. VaultBot did not download original audio files. " + "; ".join(errors[:5])
     )
 
 
@@ -5103,8 +4827,6 @@ async def juicewrld_radio_command(ctx: commands.Context, action: str = "on"):
 
     if action not in {"on", "start", ""}:
         return await ctx.send(f"Usage: `{PREFIX}jwradio` to start or `{PREFIX}jwradio off` to disable it.")
-    if not _traffic_can_start_music():
-        return await ctx.send(embed=_traffic_protection_embed(hard=_traffic_is_blocked()))
     if guild_id in jw_radio_active:
         return await ctx.send("📻 Juice WRLD Radio is already active. Use `~jwradio off` to disable it.")
 
@@ -5184,8 +4906,7 @@ async def juicewrld_radio_command(ctx: commands.Context, action: str = "on"):
             pass
         jw_radio_starting.discard(guild_id)
 
-    # If someone disabled radio while the initial file was downloading, don't
-    # enqueue or start the track after the disable command.
+    # If someone disabled radio while the stream endpoint was being checked, do not enqueue it afterward.
     if guild_id not in jw_radio_active:
         clean_temp_file(track.local_path)
         return await _set_music_status(ctx, status_message, "📻 Radio was disabled", "Juice WRLD Radio was disabled before it could start.", color=discord.Color.orange().value)
@@ -5195,7 +4916,7 @@ async def juicewrld_radio_command(ctx: commands.Context, action: str = "on"):
     await ctx.send(embed=_music_status_embed(
         "📻 JUICE WRLD RADIO  //  ONLINE",
         f"`◉ RADIO ACTIVE`  `⬡ AUTO-QUEUE`\n{MUSIC_BAR}\n\n"
-        "A random track loads automatically when each song ends.\n"
+        "A compressed audio stream opens automatically when each song ends; songs are not saved to disk.\n"
         "▸ `~play` and `~jwplay` are locked while radio runs\n"
         "▸ `~jwradio off` to disable",
         JUICE_COLOR,
@@ -5207,8 +4928,6 @@ async def juicewrld_play_command(ctx: commands.Context, *, query: str = ""):
     """Search the Juice WRLD API and queue its audio in the shared music player."""
     if not ctx.guild:
         return await ctx.send("Use this command inside a server.")
-    if not _traffic_can_start_music():
-        return await ctx.send(embed=_traffic_protection_embed(hard=_traffic_is_blocked()))
     if ctx.guild.id in jw_radio_active:
         return await ctx.send(
             f"📻 **Juice WRLD Radio is active** in this server. Disable it with `~jwradio off` "
@@ -5237,15 +4956,9 @@ async def juicewrld_play_command(ctx: commands.Context, *, query: str = ""):
     await ctx.typing()
     try:
         if wants_random:
-            payload = await _juicewrld_api_get("/files/list-all/")
-            entries = _juicewrld_items(payload)
-            audio_files = _jw_audio_candidates(entries, query="", limit=10000)
-            if not audio_files:
-                # Some API deployments expose playable files through browse
-                # even when the flat listing is unavailable or empty.
-                payload = await _juicewrld_api_get("/files/browse/")
-                entries = _juicewrld_items(payload)
-                audio_files = _jw_audio_candidates(entries, query="", limit=10000)
+            # Share the persistent six-hour catalog cache with radio; avoid re-fetching
+            # the large ~4,000-entry file listing for each random ~jwplay request.
+            audio_files = await _get_jw_radio_catalog()
             if not audio_files:
                 return await _set_music_status(
                     ctx, status_message, "❌ No playable Juice WRLD audio found",
@@ -5258,11 +4971,11 @@ async def juicewrld_play_command(ctx: commands.Context, *, query: str = ""):
             selected["name"] = Path(path).stem.replace("_", " ").replace("-", " ").strip()
             found_title = str(selected.get("title") or selected.get("name") or "Juice WRLD track")
             await _set_music_status(
-                ctx, status_message, "✅ Found a track — preparing audio",
-                f"**{discord.utils.escape_markdown(found_title[:180])}**\nDownloading audio and adding it to the shared queue…",
+                ctx, status_message, "✅ Found a track — opening stream",
+                f"**{discord.utils.escape_markdown(found_title[:180])}**\nOpening a compressed live stream and adding it to the shared queue…",
                 color=BRAND_COLOR,
             )
-            track = await _download_juicewrld_track(selected, ctx.author.display_name)
+            track = await _stream_juicewrld_track(selected, ctx.author.display_name)
             await queue_track(ctx, track, status_message=status_message)
             return
 
@@ -5304,28 +5017,21 @@ async def juicewrld_play_command(ctx: commands.Context, *, query: str = ""):
             return await _set_music_status(
                 ctx, status_message, "⚠️ Song found, but no playable audio",
                 f"I found **{discord.utils.escape_markdown(str(songs[0].get('name') or query)[:100])}**, "
-                "but the catalog results did not include a downloadable audio file. Try another title or `~jwfiles`.",
+                "but the catalog results did not include a streamable compressed audio path. Try another title or `~jwfiles`.",
                 color=discord.Color.orange().value,
             )
 
         found_title = str(selected.get("title") or selected.get("name") or query)
         await _set_music_status(
-            ctx, status_message, "✅ MATCH FOUND  //  PREPARING AUDIO",
-            f"`◈ MATCH`  `⬡ DOWNLOADING`\n{MUSIC_BAR}\n\n"
-            f"**{discord.utils.escape_markdown(found_title[:180])}**\nDownloading audio and adding it to the shared queue…",
+            ctx, status_message, "✅ MATCH FOUND  //  OPENING STREAM",
+            f"`◈ MATCH`  `⬡ LIVE STREAM`\n{MUSIC_BAR}\n\n"
+            f"**{discord.utils.escape_markdown(found_title[:180])}**\nOpening a compressed live stream and adding it to the shared queue…",
             color=MUSIC_COLOR.value,
         )
-        track = await _download_juicewrld_track(selected, ctx.author.display_name)
+        track = await _stream_juicewrld_track(selected, ctx.author.display_name)
         await queue_track(ctx, track, status_message=status_message)
     except Exception as exc:
         print(f"[JuiceWRLD] Playback request failed: {type(exc).__name__}: {exc}")
-        if isinstance(exc, TrafficBudgetError) or _traffic_is_blocked():
-            await _set_music_status(
-                ctx, status_message, "🛡️ TRAFFIC GUARD  //  DOWNLOAD STOPPED",
-                "VaultBot stopped this transfer to protect the daily traffic budget. Music automatically pauses at the hard threshold. Run `~traffic` for the current estimate.",
-                color=discord.Color.red().value,
-            )
-            return
         await _set_music_status(
             ctx, status_message, "❌ Couldn't fetch playable audio",
             f"Details: {discord.utils.escape_markdown(str(exc))[:220]}",
@@ -5803,8 +5509,6 @@ _ai_http_semaphore = asyncio.Semaphore(3)
 
 async def _groq_chat_reply(user_id: int, conversation_id: int, prompt: str) -> str:
     """Ask Groq's OpenAI-compatible chat-completions API."""
-    if _traffic_is_blocked():
-        raise TrafficBudgetError("VaultBot paused optional AI requests to protect the hosting traffic budget. Try again after usage ages out.")
     if not GROQ_API_KEY:
         raise RuntimeError(
             "AI isn't configured yet. Add GROQ_API_KEY to your host environment "
@@ -6737,8 +6441,6 @@ def _save() -> None:
 # Steam lookups
 # -----------------------------------------------------------------------------
 async def _get_json(url: str, params: dict):
-    if _traffic_is_blocked():
-        return {}
     timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(url, params=params, headers={"Accept": "application/json"}) as resp:
@@ -7266,8 +6968,6 @@ _digest_cache: dict = {}
 
 async def _ai_digest(appid: str, game: str, item: dict) -> Optional[dict]:
     """Optional: let an AI model write the summary. Needs ANTHROPIC_API_KEY; returns None otherwise."""
-    if _traffic_is_blocked():
-        return None
     key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not key:
         return None
@@ -7807,8 +7507,6 @@ FEEDS = {
 
 async def _fetch_items(key: str) -> list:
     """One entry point for every source: a Steam app ID or a feed key."""
-    if _traffic_is_blocked():
-        return []
     if key in FEEDS:
         return await FEEDS[key][1]()
     if key.startswith("feed:"):
@@ -7828,9 +7526,6 @@ def _remember(appid: str, gids: list) -> None:
 
 
 async def poll_once() -> None:
-    # Stop optional update polling when the safety budget is exhausted.
-    if _traffic_is_blocked():
-        return
     targets: dict = {}   # game ID -> [(server ID, subscription), ...]
     for guild_id, games in _subs.items():
         for appid, sub in games.items():
@@ -7839,9 +7534,6 @@ async def poll_once() -> None:
     changed = False
     cutoff = time.time() - MAX_AGE_DAYS * 86400
     for appid, subscribers in targets.items():
-        if _traffic_is_blocked():
-            print("[PatchNotes] Pausing remaining source checks to protect the traffic budget.", flush=True)
-            break
         try:
             items = await _fetch_items(appid)
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
@@ -8414,7 +8106,7 @@ async def _drops_poll_once() -> None:
     global _drops_baseline, _drops_fail_count, _drops_owner_notified
     global _drops_last_ok, _drops_last_error
 
-    if not DROPS_FEED_URL or _traffic_is_blocked():
+    if not DROPS_FEED_URL:
         return
 
     try:
@@ -8686,635 +8378,6 @@ _install_drops()
 
 
 # =============================================================================
-# 12e. XP, LEVELS, ACHIEVEMENTS & INTERACTIVE LEADERBOARDS
-# =============================================================================
-# Additive module: uses SQLite and the existing discord.py bot/tree.
-import sqlite3
-from datetime import datetime, timezone, timedelta
-
-XP_DB_PATH = Path(os.getenv("VAULTBOT_XP_DB", str(Path(__file__).with_name("vaultbot_xp.sqlite3"))))
-XP_DEFAULTS = {
-    "enabled": 1,
-    "xp_min": 15,
-    "xp_max": 25,
-    "cooldown": 60,
-    "levelup_enabled": 1,
-    "levelup_channel_id": 0,
-    "ignored_channels": "",
-    "ignored_roles": "",
-    "voice_enabled": 0,
-    "announcement_text": "✨ {member} reached **Level {level}**!",
-}
-XP_COLOR = discord.Color.from_rgb(112, 78, 190)
-XP_ACHIEVEMENTS = {
-    "first_message": {"name": "First Steps", "description": "Send your first eligible message.", "icon": "👋", "kind": "messages", "target": 1, "rarity": "Common"},
-    "chatterbox": {"name": "Chatterbox", "description": "Send 100 eligible messages.", "icon": "💬", "kind": "messages", "target": 100, "rarity": "Common"},
-    "social_regular": {"name": "Social Regular", "description": "Be active on 7 different days.", "icon": "📅", "kind": "days", "target": 7, "rarity": "Uncommon"},
-    "rising_star": {"name": "Rising Star", "description": "Reach level 10.", "icon": "🌟", "kind": "level", "target": 10, "rarity": "Uncommon"},
-    "dedicated": {"name": "Dedicated", "description": "Reach level 25.", "icon": "💎", "kind": "level", "target": 25, "rarity": "Rare"},
-    "veteran": {"name": "Veteran", "description": "Reach level 50.", "icon": "🏆", "kind": "level", "target": 50, "rarity": "Epic"},
-    "legend": {"name": "Legend", "description": "Reach level 100.", "icon": "👑", "kind": "level", "target": 100, "rarity": "Legendary"},
-    "collector": {"name": "Collector", "description": "Unlock 10 achievements.", "icon": "🗃️", "kind": "achievements", "target": 10, "rarity": "Rare"},
-}
-_xp_last_award: dict[tuple[int, int], float] = {}
-_xp_voice_awarded: dict[tuple[int, int], float] = {}
-
-
-def _xp_connect():
-    XP_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(XP_DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
-
-
-def _xp_init_db():
-    with _xp_connect() as db:
-        db.executescript("""
-        CREATE TABLE IF NOT EXISTS xp_profiles (
-            guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
-            total_xp INTEGER NOT NULL DEFAULT 0, messages INTEGER NOT NULL DEFAULT 0,
-            active_days INTEGER NOT NULL DEFAULT 0, last_active_day TEXT NOT NULL DEFAULT '',
-            PRIMARY KEY (guild_id, user_id));
-        CREATE TABLE IF NOT EXISTS xp_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL, amount INTEGER NOT NULL, created_at TEXT NOT NULL);
-        CREATE INDEX IF NOT EXISTS xp_events_guild_date ON xp_events(guild_id, created_at);
-        CREATE TABLE IF NOT EXISTS xp_achievements (
-            guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, achievement_key TEXT NOT NULL,
-            unlocked_at TEXT NOT NULL, PRIMARY KEY (guild_id, user_id, achievement_key));
-        CREATE TABLE IF NOT EXISTS xp_settings (
-            guild_id INTEGER PRIMARY KEY, settings_json TEXT NOT NULL DEFAULT '{}');
-        CREATE TABLE IF NOT EXISTS xp_level_rewards (
-            guild_id INTEGER NOT NULL, level INTEGER NOT NULL, role_id INTEGER NOT NULL,
-            PRIMARY KEY (guild_id, level));
-        CREATE TABLE IF NOT EXISTS profile_presence (
-            guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
-            joins INTEGER NOT NULL DEFAULT 0, leaves INTEGER NOT NULL DEFAULT 0,
-            first_recorded_join TEXT, last_joined TEXT,
-            PRIMARY KEY (guild_id, user_id));
-        """)
-
-
-def _xp_settings(guild_id: int) -> dict:
-    with _xp_connect() as db:
-        row = db.execute("SELECT settings_json FROM xp_settings WHERE guild_id=?", (guild_id,)).fetchone()
-    settings = dict(XP_DEFAULTS)
-    if row:
-        try:
-            settings.update(json.loads(row["settings_json"]))
-        except (ValueError, TypeError):
-            pass
-    return settings
-
-
-def _xp_save_settings(guild_id: int, settings: dict) -> None:
-    with _xp_connect() as db:
-        db.execute("INSERT INTO xp_settings(guild_id,settings_json) VALUES(?,?) ON CONFLICT(guild_id) DO UPDATE SET settings_json=excluded.settings_json",
-                   (guild_id, json.dumps(settings)))
-
-
-def _xp_level(total_xp: int) -> int:
-    # Level N requires 100*N*(N+1)/2 total XP; level 1 begins at 100 XP.
-    level = 0
-    while total_xp >= 100 * (level + 1) * (level + 2) // 2:
-        level += 1
-    return level
-
-
-def _xp_level_progress(total_xp: int) -> tuple[int, int, int]:
-    level = _xp_level(total_xp)
-    current_floor = 100 * level * (level + 1) // 2
-    next_floor = 100 * (level + 1) * (level + 2) // 2
-    return level, total_xp - current_floor, max(1, next_floor - current_floor)
-
-
-def _xp_unlock(db, guild_id: int, user_id: int, key: str) -> bool:
-    if key not in XP_ACHIEVEMENTS:
-        return False
-    cur = db.execute("INSERT OR IGNORE INTO xp_achievements(guild_id,user_id,achievement_key,unlocked_at) VALUES(?,?,?,?)",
-                      (guild_id, user_id, key, datetime.now(timezone.utc).isoformat()))
-    return cur.rowcount > 0
-
-
-def _xp_check_achievements(db, guild_id: int, user_id: int, total_xp: int, messages: int, active_days: int) -> list[str]:
-    level = _xp_level(total_xp)
-    earned = []
-    for key, item in XP_ACHIEVEMENTS.items():
-        value = {"messages": messages, "days": active_days, "level": level}.get(item["kind"], 0)
-        if item["kind"] == "achievements":
-            value = db.execute("SELECT COUNT(*) FROM xp_achievements WHERE guild_id=? AND user_id=?", (guild_id, user_id)).fetchone()[0]
-        if value >= item["target"] and _xp_unlock(db, guild_id, user_id, key):
-            earned.append(key)
-    return earned
-
-
-async def _xp_process_message(message: discord.Message):
-    if not message.guild or message.author.bot or message.webhook_id or message.author.system:
-        return
-    if message.content.startswith(PREFIX):
-        return
-    guild_id, user_id = message.guild.id, message.author.id
-    settings = _xp_settings(guild_id)
-    if not settings.get("enabled", 1):
-        return
-    try:
-        ignored_channels = {int(x) for x in str(settings.get("ignored_channels", "")).split(",") if x.strip()}
-        ignored_roles = {int(x) for x in str(settings.get("ignored_roles", "")).split(",") if x.strip()}
-    except ValueError:
-        ignored_channels, ignored_roles = set(), set()
-    if message.channel.id in ignored_channels or any(r.id in ignored_roles for r in getattr(message.author, "roles", [])):
-        return
-    now = time.time()
-    cooldown_key = (guild_id, user_id)
-    if now - _xp_last_award.get(cooldown_key, 0) < max(1, int(settings.get("cooldown", 60))):
-        # Count message statistics only for eligible chat, not every rapid message.
-        return
-    _xp_last_award[cooldown_key] = now
-    amount = random.randint(max(0, int(settings.get("xp_min", 15))), max(0, int(settings.get("xp_max", 25))))
-    today = datetime.now(timezone.utc).date().isoformat()
-    unlocked = []
-    with _xp_connect() as db:
-        row = db.execute("SELECT * FROM xp_profiles WHERE guild_id=? AND user_id=?", (guild_id, user_id)).fetchone()
-        old_xp = int(row["total_xp"]) if row else 0
-        old_level = _xp_level(old_xp)
-        old_messages = int(row["messages"]) if row else 0
-        old_days = int(row["active_days"]) if row else 0
-        last_day = row["last_active_day"] if row else ""
-        new_days = old_days + (1 if last_day != today else 0)
-        new_xp = old_xp + amount
-        new_messages = old_messages + 1
-        db.execute("INSERT INTO xp_profiles(guild_id,user_id,total_xp,messages,active_days,last_active_day) VALUES(?,?,?,?,?,?) ON CONFLICT(guild_id,user_id) DO UPDATE SET total_xp=excluded.total_xp,messages=excluded.messages,active_days=excluded.active_days,last_active_day=excluded.last_active_day",
-                   (guild_id, user_id, new_xp, new_messages, new_days, today))
-        db.execute("INSERT INTO xp_events(guild_id,user_id,amount,created_at) VALUES(?,?,?,?)",
-                   (guild_id, user_id, amount, datetime.now(timezone.utc).isoformat()))
-        unlocked = _xp_check_achievements(db, guild_id, user_id, new_xp, new_messages, new_days)
-        new_level = _xp_level(new_xp)
-        reward_rows = db.execute("SELECT level,role_id FROM xp_level_rewards WHERE guild_id=? AND level<=?", (guild_id, new_level)).fetchall() if new_level > old_level else []
-    if new_level > old_level:
-        # Role grants are best-effort; missing permissions must not break XP tracking.
-        for reward in reward_rows:
-            role = message.guild.get_role(int(reward["role_id"]))
-            if role and role not in message.author.roles:
-                try:
-                    await message.author.add_roles(role, reason=f"VaultBot level reward: level {reward['level']}")
-                except (discord.Forbidden, discord.HTTPException):
-                    pass
-        if settings.get("levelup_enabled", 1):
-            channel_id = int(settings.get("levelup_channel_id", 0) or message.channel.id)
-            channel = message.guild.get_channel(channel_id)
-            if channel:
-                template = str(settings.get("announcement_text", XP_DEFAULTS["announcement_text"]))
-                try:
-                    announcement = template.format(member=message.author.mention, level=new_level, xp=new_xp)
-                    await channel.send(announcement, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
-                except (discord.HTTPException, ValueError, KeyError):
-                    pass
-    for key in unlocked:
-        item = XP_ACHIEVEMENTS[key]
-        try:
-            await message.channel.send(f"{item['icon']} **Achievement unlocked: {item['name']}!**\n{message.author.mention} — {item['description']}", allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
-        except discord.HTTPException:
-            pass
-
-
-def _xp_reconcile_member(guild_id: int, user_id: int) -> dict:
-    """Safely reconcile one member's profile from its XP event log.
-
-    Never lowers existing stats: if the event log appears incomplete, leave the
-    profile untouched and report that fact for diagnostics.
-    """
-    with _xp_connect() as db:
-        profile = db.execute(
-            "SELECT total_xp,messages,active_days,last_active_day FROM xp_profiles WHERE guild_id=? AND user_id=?",
-            (guild_id, user_id),
-        ).fetchone()
-        aggregate = db.execute(
-            """SELECT COALESCE(SUM(amount),0) AS total_xp,
-                      COUNT(*) AS messages,
-                      COUNT(DISTINCT substr(created_at,1,10)) AS active_days,
-                      MAX(substr(created_at,1,10)) AS last_active_day
-               FROM xp_events WHERE guild_id=? AND user_id=?""",
-            (guild_id, user_id),
-        ).fetchone()
-
-        event_xp = int(aggregate["total_xp"] or 0)
-        event_messages = int(aggregate["messages"] or 0)
-        event_days = int(aggregate["active_days"] or 0)
-        event_last_day = aggregate["last_active_day"] or ""
-        profile_xp = int(profile["total_xp"]) if profile else 0
-        profile_messages = int(profile["messages"]) if profile else 0
-        profile_days = int(profile["active_days"]) if profile else 0
-
-        # Only rebuild when the durable event ledger can account for at least
-        # every existing statistic. This avoids destroying older data if event
-        # history is incomplete.
-        safe_to_rebuild = event_messages > 0 and (
-            event_xp >= profile_xp
-            and event_messages >= profile_messages
-            and event_days >= profile_days
-        )
-        repaired = False
-        if safe_to_rebuild and (
-            profile is None
-            or event_xp != profile_xp
-            or event_messages != profile_messages
-            or event_days != profile_days
-            or (profile and str(profile["last_active_day"] or "") != event_last_day)
-        ):
-            db.execute(
-                """INSERT INTO xp_profiles(guild_id,user_id,total_xp,messages,active_days,last_active_day)
-                   VALUES(?,?,?,?,?,?)
-                   ON CONFLICT(guild_id,user_id) DO UPDATE SET
-                     total_xp=excluded.total_xp,
-                     messages=excluded.messages,
-                     active_days=excluded.active_days,
-                     last_active_day=excluded.last_active_day""",
-                (guild_id, user_id, event_xp, event_messages, event_days, event_last_day),
-            )
-            repaired = True
-
-        current = db.execute(
-            "SELECT total_xp,messages,active_days,last_active_day FROM xp_profiles WHERE guild_id=? AND user_id=?",
-            (guild_id, user_id),
-        ).fetchone()
-        return {
-            "profile_exists": current is not None,
-            "total_xp": int(current["total_xp"]) if current else 0,
-            "messages": int(current["messages"]) if current else 0,
-            "active_days": int(current["active_days"]) if current else 0,
-            "last_active_day": str(current["last_active_day"] or "") if current else "",
-            "event_xp": event_xp,
-            "event_messages": event_messages,
-            "event_days": event_days,
-            "event_last_day": event_last_day,
-            "repaired": repaired,
-            "event_history_incomplete": bool(profile and not safe_to_rebuild and (
-                event_xp != profile_xp or event_messages != profile_messages or event_days != profile_days
-            )),
-        }
-
-
-def _xp_profile_embed(guild: discord.Guild, member: discord.Member) -> discord.Embed:
-    _xp_reconcile_member(guild.id, member.id)
-    with _xp_connect() as db:
-        row = db.execute("SELECT * FROM xp_profiles WHERE guild_id=? AND user_id=?", (guild.id, member.id)).fetchone()
-        rank = db.execute("SELECT COUNT(*)+1 FROM xp_profiles WHERE guild_id=? AND total_xp > COALESCE((SELECT total_xp FROM xp_profiles WHERE guild_id=? AND user_id=?),-1)", (guild.id, guild.id, member.id)).fetchone()[0]
-        earned = db.execute("SELECT achievement_key FROM xp_achievements WHERE guild_id=? AND user_id=? ORDER BY unlocked_at", (guild.id, member.id)).fetchall()
-    xp = int(row["total_xp"]) if row else 0
-    messages = int(row["messages"]) if row else 0
-    days = int(row["active_days"]) if row else 0
-    level, in_level, required = _xp_level_progress(xp)
-    pct = min(100, int(in_level * 100 / required))
-    bar = "▰" * (pct // 10) + "▱" * (10 - pct // 10)
-    embed = discord.Embed(title=f"⬡ {member.display_name} • VaultBot Rank", color=XP_COLOR)
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.description = f"**Level {level}**  ·  Server rank **#{rank}**\n`{bar}` **{pct}%** to the next level\n**{xp:,} XP** total"
-    embed.add_field(name="Messages", value=f"{messages:,}", inline=True)
-    embed.add_field(name="Active days", value=f"{days:,}", inline=True)
-    embed.add_field(name="Achievements", value=f"{len(earned)}/{len(XP_ACHIEVEMENTS)}", inline=True)
-    if earned:
-        badges = [f"{XP_ACHIEVEMENTS[r['achievement_key']]['icon']} {XP_ACHIEVEMENTS[r['achievement_key']]['name']}" for r in earned if r["achievement_key"] in XP_ACHIEVEMENTS]
-        embed.add_field(name="Unlocked badges", value=" • ".join(badges)[:1024], inline=False)
-    embed.set_footer(text="VAULTBOT SYSTEMS  •  XP & ACHIEVEMENTS")
-    return embed
-
-
-def _xp_leaderboard_embed(guild: discord.Guild, category: str, page: int, per_page: int = 10) -> discord.Embed:
-    now = datetime.now(timezone.utc)
-    if category == "weekly":
-        start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-        sql = "SELECT user_id,SUM(amount) score FROM xp_events WHERE guild_id=? AND created_at>=? GROUP BY user_id ORDER BY score DESC,user_id LIMIT ? OFFSET ?"
-        args = (guild.id, start, per_page, page * per_page)
-        label = "Weekly XP"
-    elif category == "monthly":
-        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
-        sql = "SELECT user_id,SUM(amount) score FROM xp_events WHERE guild_id=? AND created_at>=? GROUP BY user_id ORDER BY score DESC,user_id LIMIT ? OFFSET ?"
-        args = (guild.id, start, per_page, page * per_page)
-        label = "Monthly XP"
-    elif category == "messages":
-        sql = "SELECT user_id,messages score FROM xp_profiles WHERE guild_id=? ORDER BY score DESC,total_xp DESC LIMIT ? OFFSET ?"
-        args = (guild.id, per_page, page * per_page); label = "Messages"
-    elif category == "achievements":
-        sql = "SELECT user_id,COUNT(*) score FROM xp_achievements WHERE guild_id=? GROUP BY user_id ORDER BY score DESC,user_id LIMIT ? OFFSET ?"
-        args = (guild.id, per_page, page * per_page); label = "Achievements"
-    elif category == "level":
-        sql = "SELECT user_id,total_xp score FROM xp_profiles WHERE guild_id=? ORDER BY total_xp DESC,user_id LIMIT ? OFFSET ?"
-        args = (guild.id, per_page, page * per_page); label = "Level"
-    else:
-        sql = "SELECT user_id,total_xp score FROM xp_profiles WHERE guild_id=? ORDER BY total_xp DESC,user_id LIMIT ? OFFSET ?"
-        args = (guild.id, per_page, page * per_page); label = "Total XP"
-    with _xp_connect() as db:
-        rows = db.execute(sql, args).fetchall()
-        if category == "weekly":
-            count = db.execute("SELECT COUNT(DISTINCT user_id) FROM xp_events WHERE guild_id=? AND created_at>=?", (guild.id, start)).fetchone()[0]
-        elif category == "monthly":
-            count = db.execute("SELECT COUNT(DISTINCT user_id) FROM xp_events WHERE guild_id=? AND created_at>=?", (guild.id, start)).fetchone()[0]
-        elif category == "achievements":
-            count = db.execute("SELECT COUNT(DISTINCT user_id) FROM xp_achievements WHERE guild_id=?", (guild.id,)).fetchone()[0]
-        else:
-            count = db.execute("SELECT COUNT(*) FROM xp_profiles WHERE guild_id=?", (guild.id,)).fetchone()[0]
-    lines = []
-    for i, row in enumerate(rows, start=page * per_page + 1):
-        member = guild.get_member(int(row["user_id"]))
-        if not member:
-            continue
-        score = int(row["score"] or 0)
-        if category == "level":
-            value = f"Level {_xp_level(score)} · {score:,} XP"
-        elif category == "achievements":
-            value = f"{score} achievement(s)"
-        elif category == "messages":
-            value = f"{score:,} messages"
-        else:
-            value = f"{score:,} XP"
-        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"`#{i}`")
-        lines.append(f"{medal} **{discord.utils.escape_markdown(member.display_name)}** — {value}")
-    embed = discord.Embed(title=f"🏆 VaultBot • {label} Leaderboard", description="\n".join(lines) if lines else "No rankings yet. Start chatting to earn XP!", color=XP_COLOR)
-    embed.set_footer(text=f"Page {page + 1} · {max(1, (count + per_page - 1) // per_page)}  •  {guild.name}")
-    return embed
-
-
-class XPLeaderboardView(discord.ui.View):
-    def __init__(self, guild: discord.Guild, user_id: int, category: str = "xp", page: int = 0):
-        super().__init__(timeout=180)
-        self.guild, self.user_id, self.category, self.page = guild, user_id, category, page
-        options = [discord.SelectOption(label="Total XP", value="xp", emoji="⚡"),
-                   discord.SelectOption(label="Highest Level", value="level", emoji="🌟"),
-                   discord.SelectOption(label="Messages", value="messages", emoji="💬"),
-                   discord.SelectOption(label="Achievements", value="achievements", emoji="🏅"),
-                   discord.SelectOption(label="Weekly XP", value="weekly", emoji="📅"),
-                   discord.SelectOption(label="Monthly XP", value="monthly", emoji="🗓️")]
-        for option in options:
-            option.default = option.value == category
-        self.category_select = discord.ui.Select(placeholder="Choose leaderboard category…", options=options, row=0)
-        self.category_select.callback = self._select_category
-        self.add_item(self.category_select)
-        prev = discord.ui.Button(label="Previous", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
-        prev.callback = self._previous
-        self.add_item(prev)
-        nxt = discord.ui.Button(label="Next", emoji="▶️", style=discord.ButtonStyle.primary, row=1)
-        nxt.callback = self._next
-        self.add_item(nxt)
-        profile = discord.ui.Button(label="My Rank", emoji="👤", style=discord.ButtonStyle.success, row=1)
-        profile.callback = self._my_rank
-        self.add_item(profile)
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("Run `/leaderboard` yourself to open your own controls.", ephemeral=True)
-            return False
-        return True
-
-    async def _refresh(self, interaction: discord.Interaction):
-        await interaction.response.edit_message(embed=_xp_leaderboard_embed(self.guild, self.category, self.page), view=self)
-
-    async def _select_category(self, interaction: discord.Interaction):
-        self.category = self.category_select.values[0]; self.page = 0
-        for option in self.category_select.options: option.default = option.value == self.category
-        await self._refresh(interaction)
-
-    async def _previous(self, interaction: discord.Interaction):
-        self.page = max(0, self.page - 1); await self._refresh(interaction)
-
-    async def _next(self, interaction: discord.Interaction):
-        self.page += 1
-        embed = _xp_leaderboard_embed(self.guild, self.category, self.page)
-        if embed.description == "No rankings yet. Start chatting to earn XP!": self.page = max(0, self.page - 1)
-        await interaction.response.edit_message(embed=_xp_leaderboard_embed(self.guild, self.category, self.page), view=self)
-
-    async def _my_rank(self, interaction: discord.Interaction):
-        await interaction.response.edit_message(embed=_xp_profile_embed(self.guild, interaction.user), view=None)
-
-
-class XPHubView(discord.ui.View):
-    def __init__(self, guild: discord.Guild, user_id: int):
-        super().__init__(timeout=180); self.guild, self.user_id = guild, user_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("Use `/xp` to open your own menu.", ephemeral=True); return False
-        return True
-
-    @discord.ui.button(label="My Rank", emoji="👤", style=discord.ButtonStyle.primary, row=0)
-    async def rank(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(embed=_xp_profile_embed(self.guild, interaction.user), view=self)
-
-    @discord.ui.button(label="Leaderboard", emoji="🏆", style=discord.ButtonStyle.primary, row=0)
-    async def leaderboard(self, interaction: discord.Interaction, button: discord.ui.Button):
-        view = XPLeaderboardView(self.guild, interaction.user.id)
-        await interaction.response.edit_message(embed=_xp_leaderboard_embed(self.guild, "xp", 0), view=view)
-
-    @discord.ui.button(label="Achievements", emoji="🏅", style=discord.ButtonStyle.secondary, row=0)
-    async def achievements(self, interaction: discord.Interaction, button: discord.ui.Button):
-        with _xp_connect() as db:
-            earned = {r["achievement_key"] for r in db.execute("SELECT achievement_key FROM xp_achievements WHERE guild_id=? AND user_id=?", (self.guild.id, interaction.user.id)).fetchall()}
-        lines = []
-        for key, item in XP_ACHIEVEMENTS.items():
-            status = "✅" if key in earned else "🔒"
-            lines.append(f"{status} {item['icon']} **{item['name']}** — {item['description']} *({item['rarity']})*")
-        embed = discord.Embed(title="🏅 VaultBot Achievements", description="\n".join(lines), color=XP_COLOR)
-        embed.set_footer(text=f"Unlocked {len(earned)} of {len(XP_ACHIEVEMENTS)} achievements")
-        await interaction.response.edit_message(embed=embed, view=self)
-
-    @discord.ui.button(label="Admin Settings", emoji="⚙️", style=discord.ButtonStyle.secondary, row=1)
-    async def admin(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message("You need **Manage Server** to open XP settings.", ephemeral=True); return
-        view = XPAdminView(self.guild, interaction.user.id)
-        await interaction.response.edit_message(embed=view.build_embed(), view=view)
-
-
-class XPSettingsModal(discord.ui.Modal, title="VaultBot XP Settings"):
-    xp_min = discord.ui.TextInput(label="Minimum XP per message", default="15", max_length=4)
-    xp_max = discord.ui.TextInput(label="Maximum XP per message", default="25", max_length=4)
-    cooldown = discord.ui.TextInput(label="Message cooldown in seconds", default="60", max_length=4)
-    async def on_submit(self, interaction: discord.Interaction):
-        settings = _xp_settings(interaction.guild_id)
-        try:
-            low, high, cooldown = int(self.xp_min.value), int(self.xp_max.value), int(self.cooldown.value)
-            if low < 0 or high < low or high > 1000 or not 1 <= cooldown <= 3600: raise ValueError
-        except ValueError:
-            await interaction.response.send_message("Invalid values. Use XP values from 0–1000 with max ≥ min, and cooldown 1–3600 seconds.", ephemeral=True); return
-        settings.update(xp_min=low, xp_max=high, cooldown=cooldown)
-        _xp_save_settings(interaction.guild_id, settings)
-        await interaction.response.send_message(f"Saved. XP per message: **{low}–{high}**; cooldown: **{cooldown}s**.", ephemeral=True)
-
-
-class XPAdminView(discord.ui.View):
-    def __init__(self, guild: discord.Guild, user_id: int):
-        super().__init__(timeout=180); self.guild, self.user_id = guild, user_id
-    def build_embed(self):
-        s = _xp_settings(self.guild.id)
-        embed = discord.Embed(title="⚙️ VaultBot • XP Control Center", description="Configure the leveling system for this server.", color=XP_COLOR)
-        embed.add_field(name="System", value="Enabled" if s.get("enabled", 1) else "Disabled", inline=True)
-        embed.add_field(name="XP range", value=f"{s.get('xp_min',15)}–{s.get('xp_max',25)}", inline=True)
-        embed.add_field(name="Cooldown", value=f"{s.get('cooldown',60)}s", inline=True)
-        embed.add_field(name="Level-up announcements", value="Enabled" if s.get("levelup_enabled",1) else "Disabled", inline=True)
-        embed.add_field(name="Ignored channels", value=str(len([x for x in str(s.get('ignored_channels','')).split(',') if x.strip()])), inline=True)
-        embed.set_footer(text="Manage Server required • Settings persist across restarts")
-        return embed
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.user_id or not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message("Only the administrator who opened this panel can use it.", ephemeral=True); return False
-        return True
-    @discord.ui.button(label="Edit XP & Cooldown", emoji="⚡", style=discord.ButtonStyle.primary, row=0)
-    async def edit(self, interaction: discord.Interaction, button: discord.ui.Button):
-        s = _xp_settings(self.guild.id); modal = XPSettingsModal()
-        modal.xp_min.default = str(s.get("xp_min",15)); modal.xp_max.default = str(s.get("xp_max",25)); modal.cooldown.default = str(s.get("cooldown",60))
-        await interaction.response.send_modal(modal)
-    @discord.ui.button(label="Toggle XP", emoji="🔛", style=discord.ButtonStyle.secondary, row=0)
-    async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
-        s = _xp_settings(self.guild.id); s["enabled"] = 0 if s.get("enabled",1) else 1; _xp_save_settings(self.guild.id,s)
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
-    @discord.ui.button(label="Toggle Level-Up Posts", emoji="📣", style=discord.ButtonStyle.secondary, row=0)
-    async def announcements(self, interaction: discord.Interaction, button: discord.ui.Button):
-        s = _xp_settings(self.guild.id); s["levelup_enabled"] = 0 if s.get("levelup_enabled",1) else 1; _xp_save_settings(self.guild.id,s)
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
-    @discord.ui.button(label="Set Announcement Channel", emoji="📍", style=discord.ButtonStyle.secondary, row=1)
-    async def channel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("Use `/xpchannel` in the server to choose the level-up announcement channel.", ephemeral=True)
-    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.success, row=1)
-    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-
-@bot.tree.command(name="xp", description="Open VaultBot's XP, levels, and achievements hub")
-async def xp_hub(interaction: discord.Interaction):
-    if not interaction.guild:
-        await interaction.response.send_message("Use this command inside a server.", ephemeral=True); return
-    view = XPHubView(interaction.guild, interaction.user.id)
-    embed = discord.Embed(title="⬡ VAULTBOT • LEVELING HUB", description="Earn XP by chatting, level up, unlock achievements, and climb the leaderboard.\n\nChoose an option below to get started.\nUse `/xpcheck` for a private XP data diagnostic.", color=XP_COLOR)
-    embed.set_footer(text="VAULTBOT SYSTEMS  •  XP / LEVELS / ACHIEVEMENTS")
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=False)
-
-
-@bot.tree.command(name="xpcheck", description="Privately check and safely reconcile your own XP stats")
-async def xp_check(interaction: discord.Interaction):
-    if not interaction.guild:
-        await interaction.response.send_message("Use this command inside a server.", ephemeral=True)
-        return
-
-    result = _xp_reconcile_member(interaction.guild.id, interaction.user.id)
-    settings = _xp_settings(interaction.guild.id)
-    ignored_channels = [x.strip() for x in str(settings.get("ignored_channels", "")).split(",") if x.strip()]
-    ignored_roles = [x.strip() for x in str(settings.get("ignored_roles", "")).split(",") if x.strip()]
-    user_role_ids = {role.id for role in getattr(interaction.user, "roles", [])}
-    try:
-        ignored_channel_ids = {int(value) for value in ignored_channels}
-        ignored_role_ids = {int(value) for value in ignored_roles}
-    except ValueError:
-        ignored_channel_ids, ignored_role_ids = set(), set()
-    currently_ignored_channel = interaction.channel_id in ignored_channel_ids
-    has_ignored_role = bool(user_role_ids & ignored_role_ids)
-    if result["repaired"]:
-        status = "✅ Reconciled your profile using your saved XP event history."
-    elif result["event_history_incomplete"]:
-        status = "⚠️ Your profile and event history disagree, but I left your data unchanged because the event history may be incomplete."
-    elif result["event_messages"] == 0 and result["total_xp"] > 0:
-        status = "⚠️ You have saved XP but no event history. I left your data unchanged."
-    elif not result["profile_exists"]:
-        status = "ℹ️ No XP profile or XP event history exists for your account in this server yet."
-    else:
-        status = "✅ Your profile matches the saved XP event history."
-
-    embed = discord.Embed(title="🔎 Your VaultBot XP Diagnostics", description=status, color=XP_COLOR)
-    embed.add_field(name="Your Discord ID", value=f"`{interaction.user.id}`", inline=True)
-    embed.add_field(name="Server ID", value=f"`{interaction.guild.id}`", inline=True)
-    embed.add_field(name="Current profile", value=(
-        f"XP: **{result['total_xp']:,}**\n"
-        f"Messages: **{result['messages']:,}**\n"
-        f"Active days: **{result['active_days']:,}**\n"
-        f"Last active day: **{result['last_active_day'] or '—'}**"
-    ), inline=False)
-    embed.add_field(name="Saved event history", value=(
-        f"XP total: **{result['event_xp']:,}**\n"
-        f"Events/messages: **{result['event_messages']:,}**\n"
-        f"Active days: **{result['event_days']:,}**\n"
-        f"Last event day: **{result['event_last_day'] or '—'}**"
-    ), inline=False)
-    embed.add_field(name="XP tracking settings", value=(
-        f"Enabled: **{'Yes' if settings.get('enabled', 1) else 'No'}**\n"
-        f"Ignored channels configured: **{len(ignored_channels)}**\n"
-        f"Ignored roles configured: **{len(ignored_roles)}**\n"
-        f"This channel ignored: **{'Yes' if currently_ignored_channel else 'No'}**\n"
-        f"You have an ignored role: **{'Yes' if has_ignored_role else 'No'}**\n"
-        f"XP database: **configured**"
-    ), inline=False)
-    embed.set_footer(text="Private to you • No other member's XP data was changed")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="rank", description="View your rank or another member's VaultBot XP profile")
-@app_commands.describe(member="Member whose profile you want to view")
-async def xp_rank(interaction: discord.Interaction, member: Optional[discord.Member] = None):
-    if not interaction.guild:
-        await interaction.response.send_message("Use this command inside a server.", ephemeral=True); return
-    await interaction.response.send_message(embed=_xp_profile_embed(interaction.guild, member or interaction.user), ephemeral=False)
-
-
-@bot.tree.command(name="leaderboard", description="Browse VaultBot XP and achievement leaderboards")
-async def xp_leaderboard(interaction: discord.Interaction):
-    if not interaction.guild:
-        await interaction.response.send_message("Use this command inside a server.", ephemeral=True); return
-    view = XPLeaderboardView(interaction.guild, interaction.user.id)
-    await interaction.response.send_message(embed=_xp_leaderboard_embed(interaction.guild, "xp", 0), view=view)
-
-
-@bot.tree.command(name="achievements", description="Browse VaultBot achievements for yourself or a member")
-@app_commands.describe(member="Member whose achievements you want to view")
-async def xp_achievements(interaction: discord.Interaction, member: Optional[discord.Member] = None):
-    if not interaction.guild:
-        await interaction.response.send_message("Use this command inside a server.", ephemeral=True); return
-    target = member or interaction.user
-    with _xp_connect() as db:
-        earned = {r["achievement_key"] for r in db.execute("SELECT achievement_key FROM xp_achievements WHERE guild_id=? AND user_id=?", (interaction.guild.id, target.id)).fetchall()}
-    lines = [f"{'✅' if key in earned else '🔒'} {item['icon']} **{item['name']}** — {item['description']} *({item['rarity']})*" for key, item in XP_ACHIEVEMENTS.items()]
-    embed = discord.Embed(title=f"🏅 {target.display_name}'s Achievements", description="\n".join(lines), color=XP_COLOR)
-    embed.set_footer(text=f"Unlocked {len(earned)} of {len(XP_ACHIEVEMENTS)}")
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="xpadmin", description="Open VaultBot's XP administration panel")
-@app_commands.default_permissions(manage_guild=True)
-async def xp_admin(interaction: discord.Interaction):
-    if not interaction.guild or not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message("You need **Manage Server** permission to configure XP.", ephemeral=True); return
-    view = XPAdminView(interaction.guild, interaction.user.id)
-    await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
-
-
-@bot.tree.command(name="xpchannel", description="Set the channel for VaultBot level-up announcements")
-@app_commands.describe(channel="Channel where level-up announcements should be posted")
-@app_commands.default_permissions(manage_guild=True)
-async def xp_channel(interaction: discord.Interaction, channel: discord.TextChannel):
-    if not interaction.guild or not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message("You need **Manage Server** permission.", ephemeral=True); return
-    settings = _xp_settings(interaction.guild.id); settings["levelup_channel_id"] = channel.id; _xp_save_settings(interaction.guild.id, settings)
-    await interaction.response.send_message(f"Level-up announcements will be sent to {channel.mention}.", ephemeral=True)
-
-
-@bot.tree.command(name="xpreward", description="Set or update a level-based role reward")
-@app_commands.describe(level="Level required to earn this role", role="Role granted at this level")
-@app_commands.default_permissions(manage_guild=True)
-async def xp_reward(interaction: discord.Interaction, level: app_commands.Range[int, 1, 1000], role: discord.Role):
-    if not interaction.guild or not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message("You need **Manage Server** permission.", ephemeral=True); return
-    if role.is_default() or role >= interaction.guild.me.top_role:
-        await interaction.response.send_message("I can't grant that role. Move my role above the reward role and choose a normal server role.", ephemeral=True); return
-    with _xp_connect() as db:
-        db.execute("INSERT INTO xp_level_rewards(guild_id,level,role_id) VALUES(?,?,?) ON CONFLICT(guild_id,level) DO UPDATE SET role_id=excluded.role_id", (interaction.guild.id, level, role.id))
-    await interaction.response.send_message(f"Saved reward: members reaching level **{level}** will receive {role.mention}.", ephemeral=True)
-
-
-# Initialize storage before the bot starts. Errors fail loudly instead of silently losing XP.
-_xp_init_db()
-print(f"[XP] SQLite storage ready: {XP_DB_PATH}")
-
-
-
-# =============================================================================
 # VAULT CONTROL CENTER — lightweight interactive dashboard
 # =============================================================================
 VAULT_RED = discord.Color.from_rgb(255, 35, 55)
@@ -9374,27 +8437,27 @@ def _vault_control_embed(page: str, guild: Optional[discord.Guild]) -> discord.E
         modules = [
             ('🎮 GAME RADAR', '`/freestuff` • `/patchnotes`', 'Free offers, Steam game announcements, and supported game feeds.'),
             ('🎵 MUSIC ENGINE', '`~play` • `~queue` • `~nowplaying`', 'Voice playback and queue controls.'),
-            ('🖤 JUICE WRLD', '`~jwplay` • `~jwradio` • `~jwsong`', 'Queues catalog audio, plays continuous random radio, and searches song metadata.'),
+            ('🖤 JUICE WRLD', '`~jwplay` • `~jwradio` • `~jwsong`', 'Streams compressed catalog audio directly through FFmpeg; original audio files are not downloaded as fallback.'),
             ('🛡️ MODERATION', '`~ban` • `~timeout` • `~clear`', 'Server moderation tools, subject to permissions.'),
         ]
         for name, commands_text, description in modules:
             embed.add_field(name=name, value=f'{description}\n{commands_text}', inline=False)
         embed.set_footer(text='Some notification systems require channel/API settings before they can deliver alerts.')
     elif page == 'community':
-        embed.title = '▰ COMMUNITY & PROGRESSION'
-        embed.description = 'Member-facing tools for activity, recognition, and server discovery.'
-        embed.add_field(name='🏆 XP & LEVELS', value='`/xp` — open the XP hub\n`/rank` — view a member rank\n`/leaderboard` — browse rankings', inline=False)
-        embed.add_field(name='✨ ACHIEVEMENTS', value='`/achievements` — browse achievement progress\n`/xpreward` — configure level role rewards (staff)', inline=False)
-        embed.add_field(name='👤 MEMBER PROFILES', value='`~profile` — view member information and available profile stats.', inline=False)
-        embed.add_field(name='📣 COMMUNITY TOOLS', value='`/announce` — staff announcements\n`/musicdrop` — publish a music release with link buttons', inline=False)
-        embed.set_footer(text='Role rewards and administration actions still follow Discord permissions.')
+        embed.title = '▰ COMMUNITY & TOOLS'
+        embed.description = 'Member information, server activity, and staff communication tools.'
+        embed.add_field(name='👤 MEMBER PROFILES', value='`~profile [member]` — account age, server join date, tenure, roles, and recorded join/leave history.', inline=False)
+        embed.add_field(name='📊 SERVER ACTIVITY', value='`/memberstats` and `/serverwidget` — show server membership and activity information where Discord provides it.', inline=False)
+        embed.add_field(name='📣 COMMUNITY TOOLS', value='`/announce` — staff announcements\n`/musicdrop` — publish a music release embed with download links.', inline=False)
+        embed.add_field(name='🧹 MODERATION', value='`~ban`, `~unban`, `~timeout`, `~untimeout`, and `~clear` — staff moderation tools protected by permissions.', inline=False)
+        embed.set_footer(text='Staff tools remain subject to Discord permissions and role hierarchy.')
     elif page == 'commands':
         embed.title = '▰ QUICK COMMANDS'
         embed.description = 'Jump straight into the features you use most.'
         embed.add_field(name='START HERE', value='`/vault` or `~vault` — this dashboard\n`/help` or `~help` — full interactive command guide\n`/ping` — connection latency', inline=False)
         embed.add_field(name='GAMING & ALERTS', value='`/freestuff` • `/patchnotes`', inline=False)
         embed.add_field(name='MUSIC', value='`~play <song>` • `~queue` • `~skip` • `~pause` • `~resume` • `~nowplaying`', inline=False)
-        embed.add_field(name='XP & COMMUNITY', value='`/xp` • `/rank` • `/leaderboard` • `/achievements`', inline=False)
+        embed.add_field(name='COMMUNITY & MODERATION', value='`~profile` • `~ban` • `~timeout` • `/announce` • `/memberstats`', inline=False)
         embed.add_field(name='OWNER / STAFF', value='Use `/help` for the full list and permission notes. Admin-only actions remain permission-gated.', inline=False)
         embed.set_footer(text='Tip: Discord slash commands appear in the / command picker.')
     else:  # refresh uses overview content
