@@ -466,9 +466,13 @@ def _traffic_ensure_current_window() -> None:
 def _traffic_snapshot() -> dict:
     _traffic_ensure_current_window()
     with _TRAFFIC_LOCK:
+        # Refresh totals *before* copying the category fields. Copying first can
+        # show stale diagnostic totals if a rolling bucket expires at the same
+        # moment the snapshot is taken.
+        used_bytes = _traffic_refresh_totals_locked()
         snapshot = dict(_TRAFFIC_STATE)
         snapshot["hard_stop_notified_guilds"] = list(_TRAFFIC_STATE.get("hard_stop_notified_guilds", []))
-        snapshot["used_bytes"] = _traffic_refresh_totals_locked()
+        snapshot["used_bytes"] = used_bytes
         return snapshot
 
 
@@ -1507,12 +1511,25 @@ async def traffic_status_command(ctx: commands.Context):
             "*Diagnostics overlap with the network counter and are not added again.*"
         )
     else:
-        breakdown_value = (
-            f"🎧 Voice egress estimate: **{voice_mib:.1f} MiB**\n"
-            f"⬇️ Audio files downloaded: **{download_mib:.1f} MiB**\n"
-            f"📎 Discord audio uploads received: **{attachment_mib:.1f} MiB**\n"
-            f"🌐 Juice WRLD API response bodies: **{api_mib:.1f} MiB**"
-        )
+        diagnostic_sum_mib = download_mib + attachment_mib + api_mib + voice_mib
+        # The fallback total is based on tracked per-feature counters. If the
+        # category display disagrees dramatically with that total, flag it rather
+        # than implying that the category figures are a trustworthy breakdown.
+        mismatch_tolerance_mib = max(10.0, used_mib * 0.25)
+        if diagnostic_sum_mib > used_mib + mismatch_tolerance_mib:
+            breakdown_value = (
+                "⚠️ **Diagnostic breakdown mismatch**\n"
+                f"Category counters sum to **{diagnostic_sum_mib:.1f} MiB**, but the tracked total is **{used_mib:.1f} MiB**.\n"
+                "These figures are inconsistent, so the individual categories cannot reliably identify today's traffic source. "
+                "The displayed tracked total is used for VaultBot's guard; FadeHost's own meter remains authoritative."
+            )
+        else:
+            breakdown_value = (
+                f"🎧 Voice egress estimate: **{voice_mib:.1f} MiB**\n"
+                f"⬇️ Audio files downloaded: **{download_mib:.1f} MiB**\n"
+                f"📎 Discord audio uploads received: **{attachment_mib:.1f} MiB**\n"
+                f"🌐 Juice WRLD API response bodies: **{api_mib:.1f} MiB**"
+            )
     embed.add_field(name="Tracked usage breakdown", value=breakdown_value, inline=False)
     embed.add_field(
         name="Protection settings",
