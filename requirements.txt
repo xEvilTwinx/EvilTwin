@@ -1,0 +1,6 @@
+discord.py[voice]==2.7.1
+python-dotenv
+yt-dlp[default]
+bgutil-ytdlp-pot-provider
+aiohttp>=3.9,<4
+pynacl
